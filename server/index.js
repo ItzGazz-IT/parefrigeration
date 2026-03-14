@@ -1,0 +1,1406 @@
+require('dotenv').config();
+
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const cors = require('cors');
+const mysql = require('mysql2/promise');
+
+const app = express();
+const PORT = process.env.API_PORT || 5000;
+const buildPath = path.join(__dirname, '..', 'build');
+const buildIndexPath = path.join(buildPath, 'index.html');
+
+app.use(cors());
+app.use(express.json());
+
+const SCAN_TYPES = {
+  ACTUAL_SALE: 'ACTUAL_SALE',
+  TFFW_EXCHANGE: 'TFFW_EXCHANGE',
+  INHOUSE_EXCHANGE: 'INHOUSE_EXCHANGE',
+  TAKEALOT: 'TAKEALOT',
+  TFF_DEALER: 'TFF_DEALER',
+};
+
+const scanRules = {
+  [SCAN_TYPES.ACTUAL_SALE]: {
+    required: ['invoiceType', 'invoiceNumber', 'clientName'],
+    paymentStatus: 'UNPAID_TFFW',
+    includeWeeklyReport: 1,
+    sourceTable: 'sales',
+  },
+  [SCAN_TYPES.TFFW_EXCHANGE]: {
+    required: ['ioNumber', 'clientName'],
+    paymentStatus: 'PAID_TFFW',
+    includeWeeklyReport: 0,
+    sourceTable: 'tffw_exchanges',
+  },
+  [SCAN_TYPES.INHOUSE_EXCHANGE]: {
+    required: ['clientName'],
+    paymentStatus: 'UNPAID_INHOUSE',
+    includeWeeklyReport: 1,
+    sourceTable: 'inhouse_exchanges',
+  },
+  [SCAN_TYPES.TAKEALOT]: {
+    required: ['poNumber'],
+    paymentStatus: 'PENDING_IO',
+    includeWeeklyReport: 0,
+    sourceTable: 'takealot_scans',
+  },
+  [SCAN_TYPES.TFF_DEALER]: {
+    required: ['ioNumber', 'clientName'],
+    paymentStatus: 'PAID_TFFW',
+    includeWeeklyReport: 0,
+    sourceTable: 'tff_dealer_scans',
+  },
+};
+
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  port: Number(process.env.DB_PORT || 3306),
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+});
+
+const tableColumnCache = new Map();
+
+const getTableColumns = async (connection, tableName) => {
+  const cacheKey = `${process.env.DB_NAME}.${tableName}`;
+  if (tableColumnCache.has(cacheKey)) {
+    return tableColumnCache.get(cacheKey);
+  }
+
+  const [rows] = await connection.query(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`,
+    [process.env.DB_NAME, tableName]
+  );
+
+  const columns = new Set(rows.map((row) => row.COLUMN_NAME));
+  tableColumnCache.set(cacheKey, columns);
+  return columns;
+};
+
+const chooseExistingColumn = (columns, candidates) => {
+  return candidates.find((columnName) => columns.has(columnName));
+};
+
+const getPreferredOrderColumn = (columns) => {
+  const preferredOrder = ['created_at', 'date_received', 'id'];
+  return preferredOrder.find((columnName) => columns.has(columnName));
+};
+
+const getTableRows = async (tableName) => {
+  const connection = await pool.getConnection();
+  try {
+    const columns = await getTableColumns(connection, tableName);
+    const orderColumn = getPreferredOrderColumn(columns);
+    const orderClause = orderColumn ? ` ORDER BY \`${orderColumn}\` DESC` : '';
+    const [rows] = await connection.query(`SELECT * FROM \`${tableName}\`${orderClause}`);
+    return rows;
+  } finally {
+    connection.release();
+  }
+};
+
+const getUnitsRows = async (sourceId = null, warehouseId = null) => {
+  const [modelColumns, unitColumns] = await Promise.all([
+    pool.query(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = ?
+       AND TABLE_NAME = 'models'
+       AND COLUMN_NAME IN ('model_code', 'model_name', 'model_number', 'model_no', 'model', 'name')`,
+    [process.env.DB_NAME]
+    ),
+    pool.query(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = ?
+       AND TABLE_NAME = 'units'
+       AND COLUMN_NAME IN ('supplier_status', 'stock_status', 'warehouse_id', 'source_id')`,
+    [process.env.DB_NAME]
+    ),
+  ]);
+
+  const preferredOrder = ['model_code', 'model_name', 'model_number', 'model_no', 'model', 'name'];
+  const availableColumns = new Set(modelColumns[0].map((column) => column.COLUMN_NAME));
+  const chosenModelColumn = preferredOrder.find((column) => availableColumns.has(column));
+
+  const modelSelect = chosenModelColumn
+    ? `m.\`${chosenModelColumn}\``
+    : 'CAST(u.model_id AS CHAR)';
+  const unitColumnNames = new Set(unitColumns[0].map((column) => column.COLUMN_NAME));
+  const hasSupplierStatus = unitColumnNames.has('supplier_status');
+  const hasStockStatus = unitColumnNames.has('stock_status');
+  const hasWarehouseId = unitColumnNames.has('warehouse_id');
+  const hasSourceId = unitColumnNames.has('source_id');
+  const supplierStatusSelect = hasSupplierStatus ? 'u.supplier_status' : 'NULL';
+  const stockStatusSelect = hasStockStatus ? 'u.stock_status' : 'NULL';
+  const warehouseIdSelect = hasWarehouseId ? 'u.warehouse_id' : 'NULL';
+  const sourceIdSelect = hasSourceId ? 'u.source_id' : 'NULL';
+
+  const conditions = [];
+  const queryParams = [];
+  if (sourceId !== null && hasSourceId) {
+    conditions.push('u.source_id = ?');
+    queryParams.push(sourceId);
+  }
+  if (warehouseId !== null && hasWarehouseId) {
+    conditions.push('u.warehouse_id = ?');
+    queryParams.push(warehouseId);
+  }
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  const [rows] = await pool.query(
+    `SELECT
+       u.id,
+       u.model_id,
+       ${modelSelect} AS model,
+       ${supplierStatusSelect} AS supplier_status,
+       ${stockStatusSelect} AS stock_status,
+       ${warehouseIdSelect} AS warehouse_id,
+       ${sourceIdSelect} AS source_id,
+       u.serial_number,
+       u.stock_type,
+       u.status,
+       u.delivered,
+       u.date_received,
+       u.created_at
+     FROM units u
+     LEFT JOIN models m ON m.id = u.model_id
+     ${whereClause}
+     ORDER BY u.created_at DESC`,
+    queryParams
+  );
+
+  return rows;
+};
+
+const buildInsertFromLogicalFields = async (connection, tableName, dataByLogicalField) => {
+  const columns = await getTableColumns(connection, tableName);
+  if (!columns.size) {
+    return { inserted: false, reason: 'table-not-found' };
+  }
+
+  const concreteData = {};
+
+  Object.entries(dataByLogicalField).forEach(([logicalKey, logicalValue]) => {
+    const match = chooseExistingColumn(columns, {
+      unitId: ['unit_id', 'units_id'],
+      modelId: ['model_id'],
+      serialNumber: ['serial_number', 'serial'],
+      scanType: ['scan_type', 'sale_type', 'type'],
+      invoiceType: ['invoice_type'],
+      invoiceNumber: ['invoice_number', 'invoice_no'],
+      ioNumber: ['io_number', 'io_no'],
+      poNumber: ['po_number', 'po_no'],
+      clientName: ['client_name', 'client'],
+      paymentStatus: ['payment_status'],
+      includeWeeklyReport: ['include_weekly_report', 'weekly_report'],
+      status: ['status'],
+      scannedBy: ['scanned_by', 'user_name'],
+      scannedAt: ['scanned_at', 'created_at'],
+      createdAt: ['created_at'],
+    }[logicalKey] || []);
+
+    if (match && logicalValue !== undefined) {
+      concreteData[match] = logicalValue;
+    }
+  });
+
+  const concreteEntries = Object.entries(concreteData);
+  if (!concreteEntries.length) {
+    return { inserted: false, reason: 'no-matching-columns' };
+  }
+
+  const columnSql = concreteEntries.map(([columnName]) => `\`${columnName}\``).join(', ');
+  const placeholderSql = concreteEntries.map(() => '?').join(', ');
+  const values = concreteEntries.map(([, value]) => value);
+
+  const [result] = await connection.query(
+    `INSERT INTO \`${tableName}\` (${columnSql}) VALUES (${placeholderSql})`,
+    values
+  );
+
+  return { inserted: true, insertId: result.insertId };
+};
+
+const ensureScanOutEventsTable = async () => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.query(
+      `CREATE TABLE IF NOT EXISTS scan_out_events (
+        id INT NOT NULL AUTO_INCREMENT,
+        unit_id INT NULL,
+        model_id INT NULL,
+        serial_number VARCHAR(255) NOT NULL,
+        scan_type VARCHAR(50) NOT NULL,
+        invoice_type VARCHAR(50) NULL,
+        invoice_number VARCHAR(100) NULL,
+        io_number VARCHAR(100) NULL,
+        po_number VARCHAR(100) NULL,
+        client_name VARCHAR(255) NULL,
+        payment_status VARCHAR(50) NOT NULL,
+        include_weekly_report TINYINT(1) NOT NULL DEFAULT 0,
+        source_table VARCHAR(100) NULL,
+        status VARCHAR(50) NOT NULL DEFAULT 'SOLD',
+        scanned_by VARCHAR(255) NULL,
+        scanned_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_scan_out_events_weekly (include_weekly_report, created_at),
+        KEY idx_scan_out_events_serial (serial_number)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+    );
+  } finally {
+    connection.release();
+  }
+};
+
+const ensureRareCaseStockChangesTable = async () => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.query(
+      `CREATE TABLE IF NOT EXISTS rare_case_stock_changes (
+        id INT NOT NULL AUTO_INCREMENT,
+        unit_id INT NOT NULL,
+        serial_number VARCHAR(255) NOT NULL,
+        previous_stock_type VARCHAR(10) NOT NULL,
+        new_stock_type VARCHAR(10) NOT NULL,
+        ic_number VARCHAR(100) NOT NULL,
+        changed_by VARCHAR(255) NULL,
+        changed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_rare_case_stock_changes_unit (unit_id),
+        KEY idx_rare_case_stock_changes_ic (ic_number),
+        KEY idx_rare_case_stock_changes_changed_at (changed_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+    );
+  } finally {
+    connection.release();
+  }
+};
+
+const ensureWeeklyPaymentHistoryTable = async () => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.query(
+      `CREATE TABLE IF NOT EXISTS weekly_payment_history (
+        id INT NOT NULL AUTO_INCREMENT,
+        serial_number VARCHAR(255) NOT NULL,
+        scan_type VARCHAR(50) NULL,
+        previous_payment_status VARCHAR(50) NOT NULL,
+        new_payment_status VARCHAR(50) NOT NULL,
+        io_number VARCHAR(100) NOT NULL,
+        changed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_weekly_payment_history_serial (serial_number),
+        KEY idx_weekly_payment_history_changed_at (changed_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+    );
+  } finally {
+    connection.release();
+  }
+};
+
+const validateScanPayload = (payload) => {
+  const { scanType, serialNumber } = payload;
+
+  if (!scanType || !scanRules[scanType]) {
+    return 'Invalid scanType';
+  }
+
+  if (!serialNumber) {
+    return 'serialNumber is required';
+  }
+
+  const missingField = scanRules[scanType].required.find((fieldName) => !payload[fieldName]);
+  if (missingField) {
+    return `${missingField} is required for ${scanType}`;
+  }
+
+  return null;
+};
+
+const updateUnitAsSold = async (connection, unit) => {
+  const unitColumns = await getTableColumns(connection, 'units');
+  const updates = [];
+  const values = [];
+
+  if (unitColumns.has('status')) {
+    updates.push('`status` = ?');
+    values.push('SOLD');
+  }
+  if (unitColumns.has('delivered')) {
+    updates.push('`delivered` = ?');
+    values.push(1);
+  }
+  if (unitColumns.has('updated_at')) {
+    updates.push('`updated_at` = NOW()');
+  }
+
+  if (!updates.length) {
+    return;
+  }
+
+  values.push(unit.id);
+  await connection.query(`UPDATE units SET ${updates.join(', ')} WHERE id = ?`, values);
+};
+
+const logUnitHistoryIfAvailable = async (connection, eventPayload) => {
+  try {
+    const historyColumns = await getTableColumns(connection, 'unit_history');
+    if (!historyColumns.size) {
+      return;
+    }
+
+    await buildInsertFromLogicalFields(connection, 'unit_history', {
+      unitId: eventPayload.unit_id,
+      serialNumber: eventPayload.serial_number,
+      scanType: eventPayload.scan_type,
+      status: eventPayload.status,
+      clientName: eventPayload.client_name,
+      invoiceNumber: eventPayload.invoice_number,
+      ioNumber: eventPayload.io_number,
+      poNumber: eventPayload.po_number,
+      paymentStatus: eventPayload.payment_status,
+      scannedBy: eventPayload.scanned_by,
+      scannedAt: eventPayload.scanned_at,
+      createdAt: eventPayload.created_at,
+    });
+  } catch (error) {
+    console.error('unit_history logging skipped:', error.message);
+  }
+};
+
+app.get('/api/health', async (_req, res) => {
+  const health = {
+    ok: true,
+    api: 'up',
+    db: false,
+  };
+
+  try {
+    const [rows] = await pool.query('SELECT 1 AS ok');
+    health.db = rows?.[0]?.ok === 1;
+    return res.status(200).json(health);
+  } catch (error) {
+    health.error = 'Database connection failed';
+    return res.status(200).json(health);
+  }
+});
+
+app.get('/api/dashboard/summary', async (_req, res) => {
+  try {
+    const [unitsRows] = await pool.query('SELECT COUNT(*) AS value FROM units');
+    const [salesRows] = await pool.query('SELECT COUNT(*) AS value FROM sales');
+    const [modelsRows] = await pool.query('SELECT COUNT(*) AS value FROM models');
+    const [warehousesRows] = await pool.query('SELECT COUNT(*) AS value FROM warehouses');
+    const [deliveredRows] = await pool.query('SELECT COUNT(*) AS value FROM units WHERE delivered = 1');
+    const [weeklyRows] = await pool.query(
+      `SELECT COUNT(*) AS value
+       FROM scan_out_events
+       WHERE include_weekly_report = 1
+         AND YEARWEEK(created_at, 1) = YEARWEEK(CURDATE(), 1)`
+    );
+
+    res.json({
+      totalUnits: unitsRows[0]?.value || 0,
+      totalSales: salesRows[0]?.value || 0,
+      totalModels: modelsRows[0]?.value || 0,
+      totalWarehouses: warehousesRows[0]?.value || 0,
+      deliveredUnits: deliveredRows[0]?.value || 0,
+      weeklyReportCount: weeklyRows[0]?.value || 0,
+    });
+  } catch (error) {
+    console.error('Summary query failed:', error);
+    res.status(500).json({ error: 'Failed to load dashboard summary' });
+  }
+});
+
+app.get('/api/dashboard/warehouse-breakdown', async (_req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const [unitColumns, warehouseColumns] = await Promise.all([
+      getTableColumns(connection, 'units'),
+      getTableColumns(connection, 'warehouses'),
+    ]);
+
+    const unitWarehouseColumn = chooseExistingColumn(unitColumns, ['warehouse_id', 'warehouse', 'warehouse_name']);
+    const warehouseIdColumn = chooseExistingColumn(warehouseColumns, ['id', 'warehouse_id']);
+    const warehouseNameColumn = chooseExistingColumn(warehouseColumns, ['name', 'warehouse_name', 'warehouse', 'title']);
+
+    if (!unitWarehouseColumn) {
+      return res.json({ rows: [] });
+    }
+
+    if (warehouseIdColumn && warehouseNameColumn && unitWarehouseColumn === 'warehouse_id') {
+      const [rows] = await connection.query(
+        `SELECT
+           COALESCE(w.\`${warehouseNameColumn}\`, 'Unassigned') AS warehouse,
+           COUNT(*) AS total_units
+         FROM units u
+         LEFT JOIN warehouses w ON w.\`${warehouseIdColumn}\` = u.\`${unitWarehouseColumn}\`
+         GROUP BY COALESCE(w.\`${warehouseNameColumn}\`, 'Unassigned')
+         ORDER BY total_units DESC, warehouse ASC`
+      );
+
+      return res.json({ rows });
+    }
+
+    const [rows] = await connection.query(
+      `SELECT
+         COALESCE(NULLIF(TRIM(CAST(u.\`${unitWarehouseColumn}\` AS CHAR)), ''), 'Unassigned') AS warehouse,
+         COUNT(*) AS total_units
+       FROM units u
+       GROUP BY COALESCE(NULLIF(TRIM(CAST(u.\`${unitWarehouseColumn}\` AS CHAR)), ''), 'Unassigned')
+       ORDER BY total_units DESC, warehouse ASC`
+    );
+
+    return res.json({ rows });
+  } catch (error) {
+    console.error('Warehouse breakdown query failed:', error);
+    return res.status(500).json({ error: 'Failed to load warehouse breakdown' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.get('/api/dashboard/scanned-in-warehouse-breakdown', async (_req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const [unitColumns, warehouseColumns] = await Promise.all([
+      getTableColumns(connection, 'units'),
+      getTableColumns(connection, 'warehouses'),
+    ]);
+
+    const unitWarehouseColumn = chooseExistingColumn(unitColumns, ['warehouse_id', 'warehouse', 'warehouse_name']);
+    const warehouseIdColumn = chooseExistingColumn(warehouseColumns, ['id', 'warehouse_id']);
+    const warehouseNameColumn = chooseExistingColumn(warehouseColumns, ['name', 'warehouse_name', 'warehouse', 'title']);
+    const hasSourceId = unitColumns.has('source_id');
+
+    if (!unitWarehouseColumn || !hasSourceId) {
+      return res.json({ rows: [] });
+    }
+
+    if (warehouseIdColumn && warehouseNameColumn && unitWarehouseColumn === 'warehouse_id') {
+      const [rows] = await connection.query(
+        `SELECT
+           u.source_id,
+           CASE
+             WHEN u.source_id = 4 THEN 'TFFW Exchange'
+             WHEN u.source_id = 5 THEN 'Inhouse Exchange'
+             WHEN u.source_id = 6 THEN 'Bought Back'
+             WHEN u.source_id = 1 THEN 'TFFW Swaziland'
+             WHEN u.source_id = 2 THEN 'TFFW Durban'
+             WHEN u.source_id = 3 THEN 'TFFW Midrand'
+             ELSE CONCAT('Source ', u.source_id)
+           END AS source_name,
+           COALESCE(w.\`${warehouseNameColumn}\`, 'Unassigned') AS warehouse_name,
+           COUNT(*) AS total_units
+         FROM units u
+         LEFT JOIN warehouses w ON w.\`${warehouseIdColumn}\` = u.\`${unitWarehouseColumn}\`
+         WHERE u.source_id IN (1, 2, 3, 4, 5, 6)
+         GROUP BY
+           u.source_id,
+           CASE
+             WHEN u.source_id = 4 THEN 'TFFW Exchange'
+             WHEN u.source_id = 5 THEN 'Inhouse Exchange'
+             WHEN u.source_id = 6 THEN 'Bought Back'
+             WHEN u.source_id = 1 THEN 'TFFW Swaziland'
+             WHEN u.source_id = 2 THEN 'TFFW Durban'
+             WHEN u.source_id = 3 THEN 'TFFW Midrand'
+             ELSE CONCAT('Source ', u.source_id)
+           END,
+           COALESCE(w.\`${warehouseNameColumn}\`, 'Unassigned')
+         ORDER BY warehouse_name ASC, u.source_id ASC, total_units DESC`
+      );
+
+      return res.json({ rows });
+    }
+
+    const [rows] = await connection.query(
+      `SELECT
+         u.source_id,
+         CASE
+           WHEN u.source_id = 4 THEN 'TFFW Exchange'
+           WHEN u.source_id = 5 THEN 'Inhouse Exchange'
+           WHEN u.source_id = 6 THEN 'Bought Back'
+           WHEN u.source_id = 1 THEN 'TFFW Swaziland'
+           WHEN u.source_id = 2 THEN 'TFFW Durban'
+           WHEN u.source_id = 3 THEN 'TFFW Midrand'
+           ELSE CONCAT('Source ', u.source_id)
+         END AS source_name,
+         COALESCE(NULLIF(TRIM(CAST(u.\`${unitWarehouseColumn}\` AS CHAR)), ''), 'Unassigned') AS warehouse_name,
+         COUNT(*) AS total_units
+       FROM units u
+       WHERE u.source_id IN (1, 2, 3, 4, 5, 6)
+       GROUP BY
+         u.source_id,
+         CASE
+           WHEN u.source_id = 4 THEN 'TFFW Exchange'
+           WHEN u.source_id = 5 THEN 'Inhouse Exchange'
+           WHEN u.source_id = 6 THEN 'Bought Back'
+           WHEN u.source_id = 1 THEN 'TFFW Swaziland'
+           WHEN u.source_id = 2 THEN 'TFFW Durban'
+           WHEN u.source_id = 3 THEN 'TFFW Midrand'
+           ELSE CONCAT('Source ', u.source_id)
+         END,
+         COALESCE(NULLIF(TRIM(CAST(u.\`${unitWarehouseColumn}\` AS CHAR)), ''), 'Unassigned')
+       ORDER BY warehouse_name ASC, u.source_id ASC, total_units DESC`
+    );
+
+    return res.json({ rows });
+  } catch (error) {
+    console.error('Scanned in warehouse breakdown query failed:', error);
+    return res.status(500).json({ error: 'Failed to load scanned in warehouse breakdown' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.get('/api/dashboard/recent-units', async (_req, res) => {
+  try {
+    const [modelColumns, unitColumns] = await Promise.all([
+      pool.query(
+      `SELECT COLUMN_NAME
+       FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = ?
+         AND TABLE_NAME = 'models'
+         AND COLUMN_NAME IN ('model_code', 'model_name', 'model_number', 'model_no', 'model', 'name')`,
+      [process.env.DB_NAME]
+      ),
+      pool.query(
+      `SELECT COLUMN_NAME
+       FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = ?
+         AND TABLE_NAME = 'units'
+         AND COLUMN_NAME IN ('supplier_status', 'stock_status', 'warehouse_id')`,
+      [process.env.DB_NAME]
+      ),
+    ]);
+
+    const preferredOrder = ['model_code', 'model_name', 'model_number', 'model_no', 'model', 'name'];
+    const availableColumns = new Set(modelColumns[0].map((column) => column.COLUMN_NAME));
+    const chosenModelColumn = preferredOrder.find((column) => availableColumns.has(column));
+
+    const modelSelect = chosenModelColumn
+      ? `m.\`${chosenModelColumn}\``
+      : 'CAST(u.model_id AS CHAR)';
+    const unitColumnNames = new Set(unitColumns[0].map((column) => column.COLUMN_NAME));
+    const hasSupplierStatus = unitColumnNames.has('supplier_status');
+    const hasStockStatus = unitColumnNames.has('stock_status');
+    const hasWarehouseId = unitColumnNames.has('warehouse_id');
+    const supplierStatusSelect = hasSupplierStatus ? 'u.supplier_status' : 'NULL';
+    const stockStatusSelect = hasStockStatus ? 'u.stock_status' : 'NULL';
+    const warehouseIdSelect = hasWarehouseId ? 'u.warehouse_id' : 'NULL';
+
+    const [rows] = await pool.query(
+      `SELECT
+         u.id,
+         u.model_id,
+         ${modelSelect} AS model,
+         ${supplierStatusSelect} AS supplier_status,
+         ${stockStatusSelect} AS stock_status,
+         ${warehouseIdSelect} AS warehouse_id,
+         u.serial_number,
+         u.stock_type,
+         u.status,
+         u.delivered,
+         u.date_received,
+         u.created_at
+       FROM units u
+       LEFT JOIN models m ON m.id = u.model_id
+       ORDER BY u.created_at DESC`
+    );
+
+    res.json({ units: rows });
+  } catch (error) {
+    console.error('Recent units query failed:', error);
+    res.status(500).json({ error: 'Failed to load recent units' });
+  }
+});
+
+app.get('/api/dashboard/units', async (_req, res) => {
+  try {
+    const rows = await getUnitsRows();
+
+    res.json({ rows });
+  } catch (error) {
+    console.error('Units query failed:', error);
+    res.status(500).json({ error: 'Failed to load units' });
+  }
+});
+
+app.get('/api/dashboard/units-by-source/:sourceId', async (req, res) => {
+  try {
+    const sourceId = Number.parseInt(req.params.sourceId, 10);
+    if (Number.isNaN(sourceId)) {
+      res.status(400).json({ error: 'Invalid source ID' });
+      return;
+    }
+
+    const rows = await getUnitsRows(sourceId);
+    res.json({ rows });
+  } catch (error) {
+    console.error('Units by source query failed:', error);
+    res.status(500).json({ error: 'Failed to load units by source' });
+  }
+});
+
+app.get('/api/dashboard/rare-cases', async (_req, res) => {
+  try {
+    const [modelColumns, unitColumns] = await Promise.all([
+      pool.query(
+        `SELECT COLUMN_NAME
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ?
+           AND TABLE_NAME = 'models'
+           AND COLUMN_NAME IN ('model_code', 'model_name', 'model_number', 'model_no', 'model', 'name')`,
+        [process.env.DB_NAME]
+      ),
+      pool.query(
+        `SELECT COLUMN_NAME
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ?
+           AND TABLE_NAME = 'units'
+           AND COLUMN_NAME IN ('supplier_status', 'stock_status', 'warehouse_id', 'source_id', 'stock_type', 'updated_at')`,
+        [process.env.DB_NAME]
+      ),
+    ]);
+
+    const unitColumnNames = new Set(unitColumns[0].map((column) => column.COLUMN_NAME));
+    if (!unitColumnNames.has('stock_type')) {
+      return res.json({ rows: [] });
+    }
+
+    const preferredOrder = ['model_code', 'model_name', 'model_number', 'model_no', 'model', 'name'];
+    const availableModelColumns = new Set(modelColumns[0].map((column) => column.COLUMN_NAME));
+    const chosenModelColumn = preferredOrder.find((column) => availableModelColumns.has(column));
+    const modelSelect = chosenModelColumn ? `m.\`${chosenModelColumn}\`` : 'CAST(u.model_id AS CHAR)';
+
+    const supplierStatusSelect = unitColumnNames.has('supplier_status') ? 'u.supplier_status' : 'NULL';
+    const stockStatusSelect = unitColumnNames.has('stock_status') ? 'u.stock_status' : 'NULL';
+    const warehouseIdSelect = unitColumnNames.has('warehouse_id') ? 'u.warehouse_id' : 'NULL';
+    const sourceIdSelect = unitColumnNames.has('source_id') ? 'u.source_id' : 'NULL';
+
+    const [rows] = await pool.query(
+      `SELECT
+         u.id,
+         u.model_id,
+         ${modelSelect} AS model,
+         ${supplierStatusSelect} AS supplier_status,
+         ${stockStatusSelect} AS stock_status,
+         ${warehouseIdSelect} AS warehouse_id,
+         ${sourceIdSelect} AS source_id,
+         u.serial_number,
+         u.stock_type,
+         u.status,
+         u.delivered,
+         u.date_received,
+         u.created_at
+       FROM units u
+       LEFT JOIN models m ON m.id = u.model_id
+       WHERE UPPER(TRIM(COALESCE(u.stock_type, ''))) = 'A'
+       ORDER BY u.created_at DESC`
+    );
+
+    return res.json({ rows });
+  } catch (error) {
+    console.error('Rare cases query failed:', error);
+    return res.status(500).json({ error: 'Failed to load rare case units' });
+  }
+});
+
+app.get('/api/dashboard/rare-cases-history', async (_req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT
+         id,
+         unit_id,
+         serial_number,
+         previous_stock_type,
+         new_stock_type,
+         ic_number,
+         changed_by,
+         changed_at,
+         created_at
+       FROM rare_case_stock_changes
+       ORDER BY changed_at DESC, id DESC`
+    );
+
+    return res.json({ rows });
+  } catch (error) {
+    console.error('Rare cases history query failed:', error);
+    return res.status(500).json({ error: 'Failed to load rare cases history' });
+  }
+});
+
+app.post('/api/dashboard/rare-cases/update-stock-type', async (req, res) => {
+  const { unitId, stockType, icNumber, changedBy } = req.body || {};
+  const parsedUnitId = Number.parseInt(unitId, 10);
+  const nextStockType = String(stockType || '').trim().toUpperCase();
+  const normalizedIcNumber = String(icNumber || '').trim();
+
+  if (Number.isNaN(parsedUnitId) || parsedUnitId <= 0) {
+    return res.status(400).json({ error: 'Valid unitId is required' });
+  }
+
+  if (!['B', 'Y'].includes(nextStockType)) {
+    return res.status(400).json({ error: 'stockType must be B or Y' });
+  }
+
+  if (!normalizedIcNumber) {
+    return res.status(400).json({ error: 'icNumber is required' });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const unitColumns = await getTableColumns(connection, 'units');
+    if (!unitColumns.has('stock_type')) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'units.stock_type column does not exist' });
+    }
+
+    const [unitRows] = await connection.query(
+      'SELECT id, serial_number, stock_type FROM units WHERE id = ? LIMIT 1 FOR UPDATE',
+      [parsedUnitId]
+    );
+
+    if (!unitRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Unit not found' });
+    }
+
+    const unit = unitRows[0];
+    const currentStockType = String(unit.stock_type || '').trim().toUpperCase();
+    if (currentStockType !== 'A') {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Only units with stock_type A can be changed here' });
+    }
+
+    const updateStatements = ['`stock_type` = ?'];
+    const updateValues = [nextStockType];
+    if (unitColumns.has('updated_at')) {
+      updateStatements.push('`updated_at` = NOW()');
+    }
+    updateValues.push(parsedUnitId);
+
+    await connection.query(
+      `UPDATE units SET ${updateStatements.join(', ')} WHERE id = ?`,
+      updateValues
+    );
+
+    await connection.query(
+      `INSERT INTO rare_case_stock_changes (
+        unit_id,
+        serial_number,
+        previous_stock_type,
+        new_stock_type,
+        ic_number,
+        changed_by,
+        changed_at,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+      [
+        parsedUnitId,
+        unit.serial_number || '',
+        currentStockType,
+        nextStockType,
+        normalizedIcNumber,
+        changedBy || null,
+      ]
+    );
+
+    await connection.commit();
+    return res.json({
+      ok: true,
+      unitId: parsedUnitId,
+      serialNumber: unit.serial_number || null,
+      previousStockType: currentStockType,
+      newStockType: nextStockType,
+      icNumber: normalizedIcNumber,
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Rare case stock type update failed:', error);
+    return res.status(500).json({ error: 'Failed to update stock type' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.get('/api/dashboard/units-by-warehouse-source/:warehouseId/:sourceId', async (req, res) => {
+  try {
+    const warehouseId = parseInt(req.params.warehouseId, 10);
+    const sourceId = parseInt(req.params.sourceId, 10);
+    if (Number.isNaN(warehouseId) || Number.isNaN(sourceId)) {
+      res.status(400).json({ error: 'Invalid warehouseId or sourceId' });
+      return;
+    }
+    const rows = await getUnitsRows(sourceId, warehouseId);
+    res.json({ rows });
+  } catch (error) {
+    console.error('Units by warehouse+source query failed:', error);
+    res.status(500).json({ error: 'Failed to load units' });
+  }
+});
+
+app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const warehouseId = Number.parseInt(req.params.warehouseId, 10);
+    const scanType = String(req.params.scanType || '').trim().toUpperCase();
+
+    if (Number.isNaN(warehouseId) || !scanType) {
+      res.status(400).json({ error: 'Invalid warehouseId or scanType' });
+      return;
+    }
+
+    const unitColumns = await getTableColumns(connection, 'units');
+    if (!unitColumns.has('warehouse_id')) {
+      res.json({ rows: [] });
+      return;
+    }
+
+    const [rows] = await connection.query(
+      `SELECT
+         soe.id,
+         soe.unit_id,
+         soe.model_id,
+         soe.serial_number,
+         soe.scan_type,
+         soe.invoice_type,
+         soe.invoice_number,
+         soe.io_number,
+         soe.po_number,
+         soe.client_name,
+         soe.payment_status,
+         soe.source_table,
+         soe.status,
+         soe.scanned_by,
+         soe.scanned_at,
+         soe.created_at,
+         u.warehouse_id
+       FROM scan_out_events soe
+       LEFT JOIN units u ON u.id = soe.unit_id
+       WHERE soe.scan_type = ?
+         AND u.warehouse_id = ?
+       ORDER BY soe.created_at DESC`,
+      [scanType, warehouseId]
+    );
+
+    res.json({ rows });
+  } catch (error) {
+    console.error('Scan-out by warehouse/type query failed:', error);
+    res.status(500).json({ error: 'Failed to load scan-out rows' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.get('/api/dashboard/sales', async (_req, res) => {
+  try {
+    const rows = await getTableRows('sales');
+    res.json({ rows });
+  } catch (error) {
+    console.error('Sales query failed:', error);
+    res.status(500).json({ error: 'Failed to load sales' });
+  }
+});
+
+app.get('/api/dashboard/inhouse-exchanges', async (_req, res) => {
+  try {
+    const rows = await getTableRows('inhouse_exchanges');
+    res.json({ rows });
+  } catch (error) {
+    console.error('Inhouse exchanges query failed:', error);
+    res.status(500).json({ error: 'Failed to load inhouse exchanges' });
+  }
+});
+
+app.get('/api/dashboard/units-inhouse-exchanges', async (_req, res) => {
+  try {
+    const rows = await getUnitsRows(5);
+    res.json({ rows });
+  } catch (error) {
+    console.error('Units inhouse exchanges query failed:', error);
+    res.status(500).json({ error: 'Failed to load inhouse exchanges units' });
+  }
+});
+
+app.get('/api/dashboard/bought-back', async (_req, res) => {
+  try {
+    const rows = await getUnitsRows(6);
+    res.json({ rows });
+  } catch (error) {
+    console.error('Bought back query failed:', error);
+    res.status(500).json({ error: 'Failed to load bought back units' });
+  }
+});
+
+app.get('/api/dashboard/models', async (_req, res) => {
+  try {
+    const rows = await getTableRows('models');
+    res.json({ rows });
+  } catch (error) {
+    console.error('Models query failed:', error);
+    res.status(500).json({ error: 'Failed to load models' });
+  }
+});
+
+app.get('/api/dashboard/warehouses', async (_req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const columns = await getTableColumns(connection, 'warehouses');
+    const orderBy = columns.has('id')
+      ? ' ORDER BY `id` ASC'
+      : (columns.has('name') ? ' ORDER BY `name` ASC' : '');
+    const [rows] = await connection.query(`SELECT * FROM \`warehouses\`${orderBy}`);
+    res.json({ rows });
+  } catch (error) {
+    console.error('Warehouses query failed:', error);
+    res.status(500).json({ error: 'Failed to load warehouses' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.get('/api/dashboard/weekly-report', async (_req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const [eventSummaryRows] = await connection.query(
+      `SELECT
+         scan_type,
+         payment_status,
+         COUNT(*) AS total
+       FROM scan_out_events
+       WHERE include_weekly_report = 1
+         AND YEARWEEK(created_at, 1) = YEARWEEK(CURDATE(), 1)
+       GROUP BY scan_type, payment_status
+       ORDER BY total DESC`
+    );
+
+    const [unitColumns, salesColumns] = await Promise.all([
+      getTableColumns(connection, 'units'),
+      getTableColumns(connection, 'sales'),
+    ]);
+
+    const salesSerialColumn = chooseExistingColumn(salesColumns, ['serial_number', 'serial']);
+    const salesDateColumn = chooseExistingColumn(salesColumns, [
+      'date_sold',
+      'sale_date',
+      'created_at',
+      'date_received',
+      'scanned_at',
+      'sold_at',
+      'date',
+    ]);
+    const salesClientColumn = chooseExistingColumn(salesColumns, ['client_name', 'client']);
+    const salesPaymentColumn = chooseExistingColumn(salesColumns, ['payment_status', 'status']);
+    const unitsSupplierStatusColumn = chooseExistingColumn(unitColumns, ['supplier_status']);
+
+    const salesCanJoinUnits = Boolean(unitsSupplierStatusColumn && salesSerialColumn && unitColumns.has('serial_number'));
+
+    let salesSummaryRows = [];
+    let salesRecentRows = [];
+
+    if (salesSerialColumn) {
+      const salesPaymentSelect = salesPaymentColumn
+        ? `COALESCE(NULLIF(TRIM(CAST(s.\`${salesPaymentColumn}\` AS CHAR)), ''), '-')`
+        : "'UNSPECIFIED'";
+
+      const salesClientSelect = salesClientColumn
+        ? `s.\`${salesClientColumn}\``
+        : 'NULL';
+
+      const supplierStatusSelect = salesCanJoinUnits
+        ? `u.\`${unitsSupplierStatusColumn}\``
+        : 'NULL';
+
+      const unitJoin = salesCanJoinUnits
+        ? `LEFT JOIN units u ON u.\`serial_number\` = s.\`${salesSerialColumn}\``
+        : '';
+
+      const salesWeekFilter = salesDateColumn
+        ? `YEARWEEK(s.\`${salesDateColumn}\`, 1) = YEARWEEK(CURDATE(), 1)`
+        : '1=1';
+
+      const [summaryRows] = await connection.query(
+        `SELECT
+           'ACTUAL_SALE' AS scan_type,
+           ${salesPaymentSelect} AS payment_status,
+           COUNT(*) AS total
+         FROM sales s
+         ${unitJoin}
+         WHERE ${salesWeekFilter}
+           AND NOT EXISTS (
+             SELECT 1
+             FROM scan_out_events e
+             WHERE e.scan_type = 'ACTUAL_SALE'
+               AND YEARWEEK(e.created_at, 1) = YEARWEEK(CURDATE(), 1)
+               AND e.serial_number = s.\`${salesSerialColumn}\`
+           )
+         GROUP BY ${salesPaymentSelect}`
+      );
+      salesSummaryRows = summaryRows;
+
+      const salesCreatedAtSelect = salesDateColumn
+        ? `s.\`${salesDateColumn}\``
+        : 'NOW()';
+
+      const [recentRows] = await connection.query(
+        `SELECT
+           s.\`${salesSerialColumn}\` AS serial_number,
+           'ACTUAL_SALE' AS scan_type,
+           ${salesClientSelect} AS client_name,
+           ${salesPaymentSelect} AS payment_status,
+           ${supplierStatusSelect} AS supplier_status,
+           ${salesCreatedAtSelect} AS created_at
+         FROM sales s
+         ${unitJoin}
+         WHERE ${salesWeekFilter}
+           AND NOT EXISTS (
+             SELECT 1
+             FROM scan_out_events e
+             WHERE e.scan_type = 'ACTUAL_SALE'
+               AND YEARWEEK(e.created_at, 1) = YEARWEEK(CURDATE(), 1)
+               AND e.serial_number = s.\`${salesSerialColumn}\`
+           )
+         ORDER BY ${salesCreatedAtSelect} DESC
+         LIMIT 100`
+      );
+      salesRecentRows = recentRows;
+    }
+
+    const [eventRecentRows] = await connection.query(
+      `SELECT
+         e.serial_number,
+         e.scan_type,
+         e.client_name,
+         e.payment_status,
+         ${unitsSupplierStatusColumn ? `u.\`${unitsSupplierStatusColumn}\`` : 'NULL'} AS supplier_status,
+         e.created_at
+      FROM scan_out_events e
+       ${unitsSupplierStatusColumn ? 'LEFT JOIN units u ON u.`serial_number` = e.serial_number' : ''}
+       WHERE include_weekly_report = 1
+         AND YEARWEEK(e.created_at, 1) = YEARWEEK(CURDATE(), 1)
+       ORDER BY e.created_at DESC
+       LIMIT 25`
+    );
+
+    const summaryMap = new Map();
+    [...eventSummaryRows, ...salesSummaryRows].forEach((row) => {
+      const scanType = row.scan_type || 'UNKNOWN';
+      const paymentStatus = row.payment_status || '-';
+      const key = `${scanType}__${paymentStatus}`;
+      const current = summaryMap.get(key) || { scan_type: scanType, payment_status: paymentStatus, total: 0 };
+      current.total += Number(row.total || 0);
+      summaryMap.set(key, current);
+    });
+
+    const mergedSummaryRows = Array.from(summaryMap.values()).sort(
+      (left, right) => Number(right.total || 0) - Number(left.total || 0)
+    );
+
+    const mergedRecentRows = [...eventRecentRows, ...salesRecentRows]
+      .sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime())
+      .slice(0, 25);
+
+    res.json({ summary: mergedSummaryRows, recent: mergedRecentRows });
+  } catch (error) {
+    console.error('Weekly report query failed:', error);
+    res.status(500).json({ error: 'Failed to load weekly report' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.get('/api/dashboard/weekly-report-payment-history', async (_req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const [rows] = await connection.query(
+      `SELECT
+         id,
+         serial_number,
+         scan_type,
+         previous_payment_status,
+         new_payment_status,
+         io_number,
+         changed_at,
+         created_at
+       FROM weekly_payment_history
+       WHERE YEARWEEK(changed_at, 1) = YEARWEEK(CURDATE(), 1)
+       ORDER BY changed_at DESC, id DESC`
+    );
+
+    return res.json({ rows });
+  } catch (error) {
+    console.error('Weekly payment history query failed:', error);
+    return res.status(500).json({ error: 'Failed to load weekly payment history' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post('/api/dashboard/weekly-report/mark-paid', async (req, res) => {
+  const { serialNumber, ioNumber, scanType } = req.body || {};
+
+  const normalizedSerialNumber = String(serialNumber || '').trim();
+  const normalizedIoNumber = String(ioNumber || '').trim();
+  const normalizedScanType = String(scanType || '').trim().toUpperCase() || null;
+
+  if (!normalizedSerialNumber) {
+    return res.status(400).json({ error: 'serialNumber is required' });
+  }
+
+  if (!normalizedIoNumber) {
+    return res.status(400).json({ error: 'ioNumber is required' });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [scanOutResult] = await connection.query(
+      `UPDATE scan_out_events
+       SET payment_status = 'PAID_TFFW',
+           io_number = ?
+       WHERE serial_number = ?
+         AND include_weekly_report = 1
+         AND YEARWEEK(created_at, 1) = YEARWEEK(CURDATE(), 1)
+         AND payment_status = 'UNPAID_TFFW'`,
+      [normalizedIoNumber, normalizedSerialNumber]
+    );
+
+    const salesColumns = await getTableColumns(connection, 'sales');
+    const salesSerialColumn = chooseExistingColumn(salesColumns, ['serial_number', 'serial']);
+    const salesPaymentColumn = chooseExistingColumn(salesColumns, ['payment_status', 'status']);
+    const salesIoColumn = chooseExistingColumn(salesColumns, ['io_number', 'io_no']);
+    const salesDateColumn = chooseExistingColumn(salesColumns, [
+      'date_sold',
+      'sale_date',
+      'created_at',
+      'date_received',
+      'scanned_at',
+      'sold_at',
+      'date',
+    ]);
+
+    let salesUpdatedCount = 0;
+    if (salesSerialColumn && salesPaymentColumn) {
+      const salesSetFragments = [`\`${salesPaymentColumn}\` = 'PAID_TFFW'`];
+      const salesValues = [];
+
+      if (salesIoColumn) {
+        salesSetFragments.push(`\`${salesIoColumn}\` = ?`);
+        salesValues.push(normalizedIoNumber);
+      }
+
+      const salesWhereFragments = [
+        `\`${salesSerialColumn}\` = ?`,
+        `COALESCE(NULLIF(TRIM(CAST(\`${salesPaymentColumn}\` AS CHAR)), ''), '-') = 'UNPAID_TFFW'`,
+      ];
+
+      salesValues.push(normalizedSerialNumber);
+
+      if (salesDateColumn) {
+        salesWhereFragments.push(`YEARWEEK(\`${salesDateColumn}\`, 1) = YEARWEEK(CURDATE(), 1)`);
+      }
+
+      const [salesResult] = await connection.query(
+        `UPDATE sales
+         SET ${salesSetFragments.join(', ')}
+         WHERE ${salesWhereFragments.join(' AND ')}`,
+        salesValues
+      );
+
+      salesUpdatedCount = Number(salesResult.affectedRows || 0);
+    }
+
+    const totalUpdated = Number(scanOutResult.affectedRows || 0) + salesUpdatedCount;
+    if (!totalUpdated) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'No UNPAID_TFFW weekly record found for this serial number' });
+    }
+
+    await connection.query(
+      `INSERT INTO weekly_payment_history (
+        serial_number,
+        scan_type,
+        previous_payment_status,
+        new_payment_status,
+        io_number,
+        changed_at,
+        created_at
+      ) VALUES (?, ?, 'UNPAID_TFFW', 'PAID_TFFW', ?, NOW(), NOW())`,
+      [normalizedSerialNumber, normalizedScanType, normalizedIoNumber]
+    );
+
+    await connection.commit();
+    return res.json({
+      ok: true,
+      serialNumber: normalizedSerialNumber,
+      ioNumber: normalizedIoNumber,
+      updatedRows: totalUpdated,
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Weekly report mark paid failed:', error);
+    return res.status(500).json({ error: 'Failed to mark record as paid' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post('/api/scanout/process', async (req, res) => {
+  const payload = req.body || {};
+  const validationError = validateScanPayload(payload);
+  if (validationError) {
+    return res.status(400).json({ error: validationError });
+  }
+
+  const {
+    scanType,
+    serialNumber,
+    invoiceType,
+    invoiceNumber,
+    ioNumber,
+    poNumber,
+    clientName,
+    scannedBy,
+  } = payload;
+
+  const rule = scanRules[scanType];
+  const paymentStatus = scanType === SCAN_TYPES.TAKEALOT
+    ? (ioNumber ? 'UNPAID_TFFW' : 'PENDING_IO')
+    : rule.paymentStatus;
+
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const [unitRows] = await connection.query(
+      'SELECT id, model_id, serial_number, status FROM units WHERE serial_number = ? LIMIT 1 FOR UPDATE',
+      [serialNumber]
+    );
+
+    if (!unitRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Unit not found by serial number' });
+    }
+
+    const unit = unitRows[0];
+    await updateUnitAsSold(connection, unit);
+
+    const now = new Date();
+    const eventPayload = {
+      unit_id: unit.id,
+      model_id: unit.model_id || null,
+      serial_number: unit.serial_number,
+      scan_type: scanType,
+      invoice_type: invoiceType || null,
+      invoice_number: invoiceNumber || null,
+      io_number: ioNumber || null,
+      po_number: poNumber || null,
+      client_name: clientName || null,
+      payment_status: paymentStatus,
+      include_weekly_report: rule.includeWeeklyReport,
+      source_table: rule.sourceTable,
+      status: 'SOLD',
+      scanned_by: scannedBy || null,
+      scanned_at: now,
+      created_at: now,
+    };
+
+    const sourceInsertResult = await buildInsertFromLogicalFields(connection, rule.sourceTable, {
+      unitId: eventPayload.unit_id,
+      modelId: eventPayload.model_id,
+      serialNumber: eventPayload.serial_number,
+      scanType: eventPayload.scan_type,
+      invoiceType: eventPayload.invoice_type,
+      invoiceNumber: eventPayload.invoice_number,
+      ioNumber: eventPayload.io_number,
+      poNumber: eventPayload.po_number,
+      clientName: eventPayload.client_name,
+      paymentStatus: eventPayload.payment_status,
+      includeWeeklyReport: eventPayload.include_weekly_report,
+      status: eventPayload.status,
+      scannedBy: eventPayload.scanned_by,
+      scannedAt: eventPayload.scanned_at,
+      createdAt: eventPayload.created_at,
+    });
+
+    const eventInsertResult = await buildInsertFromLogicalFields(connection, 'scan_out_events', {
+      unitId: eventPayload.unit_id,
+      modelId: eventPayload.model_id,
+      serialNumber: eventPayload.serial_number,
+      scanType: eventPayload.scan_type,
+      invoiceType: eventPayload.invoice_type,
+      invoiceNumber: eventPayload.invoice_number,
+      ioNumber: eventPayload.io_number,
+      poNumber: eventPayload.po_number,
+      clientName: eventPayload.client_name,
+      paymentStatus: eventPayload.payment_status,
+      includeWeeklyReport: eventPayload.include_weekly_report,
+      status: eventPayload.status,
+      scannedBy: eventPayload.scanned_by,
+      scannedAt: eventPayload.scanned_at,
+      createdAt: eventPayload.created_at,
+    });
+
+    await logUnitHistoryIfAvailable(connection, eventPayload);
+    await connection.commit();
+
+    return res.json({
+      ok: true,
+      scanType,
+      serialNumber,
+      paymentStatus,
+      includeWeeklyReport: rule.includeWeeklyReport,
+      sourceInsert: sourceInsertResult,
+      eventInsert: eventInsertResult,
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Scan-out process failed:', error);
+    return res.status(500).json({ error: 'Failed to process scan-out' });
+  } finally {
+    connection.release();
+  }
+});
+
+ensureScanOutEventsTable().catch((error) => {
+  console.error('Could not ensure scan_out_events table:', error.message);
+});
+
+ensureRareCaseStockChangesTable().catch((error) => {
+  console.error('Could not ensure rare_case_stock_changes table:', error.message);
+});
+
+ensureWeeklyPaymentHistoryTable().catch((error) => {
+  console.error('Could not ensure weekly_payment_history table:', error.message);
+});
+
+if (fs.existsSync(buildIndexPath)) {
+  app.use(express.static(buildPath));
+
+  app.get(/^\/(?!api).*/, (_req, res) => {
+    res.sendFile(buildIndexPath);
+  });
+}
+
+app.listen(PORT, () => {
+  console.log(`API running on http://localhost:${PORT}`);
+});

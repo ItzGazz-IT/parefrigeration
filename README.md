@@ -45,6 +45,58 @@ You can learn more in the [Create React App documentation](https://facebook.gith
 
 To learn React, check out the [React documentation](https://reactjs.org/).
 
+## SQL API setup
+
+This project now includes a backend API in `server/index.js` that connects to MySQL.
+
+1. Create/update `.env` in the project root:
+
+	- `DB_HOST`
+	- `DB_USER`
+	- `DB_PASSWORD`
+	- `DB_NAME`
+	- `DB_PORT` (default `3306`)
+	- `API_PORT` (default `5000`)
+
+2. Run frontend + API together:
+
+	```bash
+	npm run dev
+	```
+
+3. Run in production after building the React app:
+
+	```bash
+	npm run build
+	npm run start:prod
+	```
+
+	The Express server will serve both the API and the built React app from the same domain.
+
+4. API endpoints:
+
+	- `GET /api/health`
+	- `GET /api/dashboard/summary`
+	- `GET /api/dashboard/recent-units`
+	- `GET /api/dashboard/weekly-report`
+	- `POST /api/scanout/process`
+
+## Scan-out workflow API
+
+`POST /api/scanout/process` body:
+
+- `scanType`: `ACTUAL_SALE | TFFW_EXCHANGE | INHOUSE_EXCHANGE | TAKEALOT | TFF_DEALER`
+- `serialNumber` (required for all)
+- `clientName`, `invoiceType`, `invoiceNumber`, `ioNumber`, `poNumber`, `scannedBy` (required by scan type rules)
+
+Rules implemented:
+
+- `ACTUAL_SALE`: requires invoice type + invoice number + client, marks SOLD, payment `UNPAID_TFFW`, included in weekly report.
+- `TFFW_EXCHANGE`: requires IO number + client, marks SOLD, payment `PAID_TFFW`, not included in weekly report.
+- `INHOUSE_EXCHANGE`: requires client, marks SOLD, payment `UNPAID_INHOUSE`, included in weekly report.
+- `TAKEALOT`: requires PO number, marks SOLD, payment `PENDING_IO` (or `UNPAID_TFFW` once IO is supplied), not included in weekly report.
+- `TFF_DEALER`: requires IO number + client, marks SOLD, payment `PAID_TFFW`, not included in weekly report.
+
 ### Code Splitting
 
 This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
