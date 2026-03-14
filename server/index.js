@@ -7,7 +7,7 @@ const cors = require('cors');
 const mysql = require('mysql2/promise');
 
 const app = express();
-const PORT = process.env.API_PORT || 5000;
+const PORT = Number(process.env.PORT || process.env.API_PORT || 5000);
 const buildPath = path.join(__dirname, '..', 'build');
 const buildIndexPath = path.join(buildPath, 'index.html');
 

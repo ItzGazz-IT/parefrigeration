@@ -56,7 +56,8 @@ This project now includes a backend API in `server/index.js` that connects to My
 	- `DB_PASSWORD`
 	- `DB_NAME`
 	- `DB_PORT` (default `3306`)
-	- `API_PORT` (default `5000`)
+	- `API_PORT` (local default `5000`)
+	- `PORT` (used by hosting providers like Render)
 
 2. Run frontend + API together:
 
@@ -72,6 +73,26 @@ This project now includes a backend API in `server/index.js` that connects to My
 	```
 
 	The Express server will serve both the API and the built React app from the same domain.
+
+## Deploy on Render
+
+This repository includes `render.yaml` for Blueprint deploys.
+
+1. Push your latest code to GitHub.
+2. In Render: **New +** → **Blueprint** → select this repo.
+3. Confirm service settings from `render.yaml`:
+	- Build command: `npm install; npm run build`
+	- Start command: `npm run start:prod`
+	- Health check: `/api/health`
+4. Add required environment variables in Render:
+	- `DB_HOST`
+	- `DB_PORT`
+	- `DB_USER`
+	- `DB_PASSWORD`
+	- `DB_NAME`
+	- `NODE_ENV=production`
+5. Deploy and open the generated Render URL.
+6. Add your custom domain in Render (**Settings** → **Custom Domains**) and point DNS to Render.
 
 4. API endpoints:
 
