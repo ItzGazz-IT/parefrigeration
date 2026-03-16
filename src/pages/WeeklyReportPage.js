@@ -33,11 +33,11 @@ const WeeklyReportPage = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
-  const [markPaidDialogOpen, setMarkPaidDialogOpen] = useState(false);
+  const [addIoDialogOpen, setAddIoDialogOpen] = useState(false);
   const [selectedRow, setSelectedRow] = useState(null);
   const [ioNumberInput, setIoNumberInput] = useState('');
-  const [markPaidError, setMarkPaidError] = useState('');
-  const [markPaidLoading, setMarkPaidLoading] = useState(false);
+  const [addIoError, setAddIoError] = useState('');
+  const [addIoLoading, setAddIoLoading] = useState(false);
 
   useEffect(() => {
     const loadWeeklyReport = async () => {
@@ -84,56 +84,56 @@ const WeeklyReportPage = () => {
     }
   };
 
-  const openMarkPaidDialog = (row) => {
+  const openAddIoDialog = (row) => {
     setSelectedRow(row);
-    setIoNumberInput('');
-    setMarkPaidError('');
-    setMarkPaidDialogOpen(true);
+    setIoNumberInput(String(row?.io_number || '').trim());
+    setAddIoError('');
+    setAddIoDialogOpen(true);
   };
 
-  const closeMarkPaidDialog = (forceClose = false) => {
-    if (markPaidLoading && !forceClose) {
+  const closeAddIoDialog = (forceClose = false) => {
+    if (addIoLoading && !forceClose) {
       return;
     }
 
-    setMarkPaidDialogOpen(false);
+    setAddIoDialogOpen(false);
     setSelectedRow(null);
     setIoNumberInput('');
-    setMarkPaidError('');
+    setAddIoError('');
   };
 
-  const handleConfirmMarkPaid = async () => {
+  const handleConfirmAddIo = async () => {
     const normalizedIoNumber = String(ioNumberInput || '').trim();
     if (!normalizedIoNumber) {
-      setMarkPaidError('IO number is required.');
+      setAddIoError('IO number is required.');
       return;
     }
 
     if (!selectedRow?.serial_number) {
-      setMarkPaidError('Selected row is missing a serial number.');
+      setAddIoError('Selected row is missing a serial number.');
       return;
     }
 
     try {
-      setMarkPaidLoading(true);
-      setMarkPaidError('');
+      setAddIoLoading(true);
+      setAddIoError('');
       setError('');
       setSuccessMessage('');
 
-      await apiPost('/api/dashboard/weekly-report/mark-paid', {
+      await apiPost('/api/dashboard/weekly-report/archive-item', {
         serialNumber: selectedRow.serial_number,
         ioNumber: normalizedIoNumber,
         scanType: selectedRow.scan_type || null,
       });
 
       await loadWeeklyReport();
-      setSuccessMessage(`Serial ${selectedRow.serial_number} marked as PAID_TFFW.`);
-      closeMarkPaidDialog(true);
+      setSuccessMessage(`Serial ${selectedRow.serial_number} moved to Archive.`);
+      closeAddIoDialog(true);
     } catch (requestError) {
       const serverError = requestError?.response?.data?.error;
-      setMarkPaidError(serverError || 'Failed to mark this unit as paid.');
+      setAddIoError(serverError || 'Failed to add IO and archive this unit.');
     } finally {
-      setMarkPaidLoading(false);
+      setAddIoLoading(false);
     }
   };
 
@@ -284,17 +284,13 @@ const WeeklyReportPage = () => {
                           {row.created_at ? new Date(row.created_at).toLocaleString() : '-'}
                         </TableCell>
                         <TableCell align="right">
-                          {row.payment_status === 'UNPAID_TFFW' ? (
-                            <Button
-                              variant="contained"
-                              size="small"
-                              onClick={() => openMarkPaidDialog(row)}
-                            >
-                              Mark as Paid
-                            </Button>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">-</Typography>
-                          )}
+                          <Button
+                            variant="contained"
+                            size="small"
+                            onClick={() => openAddIoDialog(row)}
+                          >
+                            Add IO
+                          </Button>
                         </TableCell>
                       </TableRow>
                     ))
@@ -347,8 +343,8 @@ const WeeklyReportPage = () => {
       )}
 
       <Dialog
-        open={markPaidDialogOpen}
-        onClose={closeMarkPaidDialog}
+        open={addIoDialogOpen}
+        onClose={closeAddIoDialog}
         fullWidth
         maxWidth="sm"
         PaperProps={{
@@ -360,14 +356,14 @@ const WeeklyReportPage = () => {
         }}
       >
         <DialogTitle sx={{ textAlign: 'center', fontWeight: 700 }}>
-          Mark Unit as Paid
+          Add IO Number
         </DialogTitle>
         <DialogContent>
           <Box sx={{ pt: 0.6, pb: 0.25, textAlign: 'center' }}>
             <Typography variant="body2" color="text.secondary">
               {selectedRow?.serial_number
                 ? `Enter IO number for serial ${selectedRow.serial_number}`
-                : 'Enter IO number to mark this item as paid.'}
+                : 'Enter IO number for this item.'}
             </Typography>
           </Box>
 
@@ -382,18 +378,18 @@ const WeeklyReportPage = () => {
             />
           </Box>
 
-          {markPaidError && (
+          {addIoError && (
             <Alert severity="error" sx={{ mt: 1.5 }}>
-              {markPaidError}
+              {addIoError}
             </Alert>
           )}
         </DialogContent>
         <DialogActions sx={{ justifyContent: 'center', pb: 2.1, px: 2.5, gap: 0.8 }}>
-          <Button variant="outlined" onClick={closeMarkPaidDialog} disabled={markPaidLoading}>
+          <Button variant="outlined" onClick={closeAddIoDialog} disabled={addIoLoading}>
             Cancel
           </Button>
-          <Button variant="contained" onClick={handleConfirmMarkPaid} disabled={markPaidLoading}>
-            {markPaidLoading ? 'Saving...' : 'Confirm'}
+          <Button variant="contained" onClick={handleConfirmAddIo} disabled={addIoLoading}>
+            {addIoLoading ? 'Saving...' : 'Confirm'}
           </Button>
         </DialogActions>
       </Dialog>
