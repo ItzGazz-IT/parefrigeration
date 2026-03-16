@@ -37,7 +37,7 @@ const scanRules = {
   },
   [SCAN_TYPES.INHOUSE_EXCHANGE]: {
     required: ['clientName'],
-    paymentStatus: 'UNPAID_INHOUSE',
+    paymentStatus: 'UNPAID_TFFW',
     includeWeeklyReport: 1,
     sourceTable: 'inhouse_exchanges',
   },
