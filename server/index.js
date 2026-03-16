@@ -1143,10 +1143,13 @@ app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', asyn
          soe.scan_type,
          soe.invoice_type,
          soe.invoice_number,
-         soe.io_number,
+         COALESCE(ar.io_number, soe.io_number) AS io_number,
          soe.po_number,
          soe.client_name,
-         soe.payment_status,
+         CASE
+           WHEN ar.id IS NOT NULL THEN 'PAID_TFFW'
+           ELSE soe.payment_status
+         END AS payment_status,
          soe.source_table,
          soe.status,
          soe.scanned_by,
@@ -1154,6 +1157,7 @@ app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', asyn
          soe.created_at,
          COALESCE(u.warehouse_id, us.warehouse_id) AS warehouse_id
        FROM scan_out_events soe
+       LEFT JOIN archive_records ar ON ar.serial_number = soe.serial_number AND ar.scan_type = soe.scan_type
        LEFT JOIN units u ON u.id = soe.unit_id
        LEFT JOIN units us ON us.serial_number = soe.serial_number
        WHERE soe.scan_type = ?
@@ -1184,10 +1188,13 @@ app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', asyn
              'ACTUAL_SALE' AS scan_type,
              ${salesInvoiceTypeColumn ? `s.\`${salesInvoiceTypeColumn}\`` : 'NULL'} AS invoice_type,
              ${salesInvoiceNumberColumn ? `s.\`${salesInvoiceNumberColumn}\`` : 'NULL'} AS invoice_number,
-             ${salesIoColumn ? `s.\`${salesIoColumn}\`` : 'NULL'} AS io_number,
+             COALESCE(ar.io_number, ${salesIoColumn ? `s.\`${salesIoColumn}\`` : 'NULL'}) AS io_number,
              NULL AS po_number,
              ${salesClientColumn ? `s.\`${salesClientColumn}\`` : 'NULL'} AS client_name,
-             ${salesPaymentColumn ? `s.\`${salesPaymentColumn}\`` : "'UNPAID_TFFW'"} AS payment_status,
+             CASE
+               WHEN ar.id IS NOT NULL THEN 'PAID_TFFW'
+               ELSE ${salesPaymentColumn ? `s.\`${salesPaymentColumn}\`` : "'UNPAID_TFFW'"}
+             END AS payment_status,
              'sales' AS source_table,
              'SOLD' AS status,
              NULL AS scanned_by,
@@ -1196,6 +1203,7 @@ app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', asyn
              u.warehouse_id AS warehouse_id
            FROM sales s
            LEFT JOIN units u ON u.serial_number = s.\`${salesSerialColumn}\`
+           LEFT JOIN archive_records ar ON ar.serial_number = s.\`${salesSerialColumn}\` AND ar.scan_type = 'ACTUAL_SALE'
            WHERE u.warehouse_id = ?
              AND NOT EXISTS (
                SELECT 1
