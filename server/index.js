@@ -1043,7 +1043,7 @@ app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', asyn
       return;
     }
 
-    const [rows] = await connection.query(
+    const [eventRows] = await connection.query(
       `SELECT
          soe.id,
          soe.unit_id,
@@ -1061,14 +1061,63 @@ app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', asyn
          soe.scanned_by,
          soe.scanned_at,
          soe.created_at,
-         u.warehouse_id
+         COALESCE(u.warehouse_id, us.warehouse_id) AS warehouse_id
        FROM scan_out_events soe
        LEFT JOIN units u ON u.id = soe.unit_id
+       LEFT JOIN units us ON us.serial_number = soe.serial_number
        WHERE soe.scan_type = ?
-         AND u.warehouse_id = ?
+         AND COALESCE(u.warehouse_id, us.warehouse_id) = ?
        ORDER BY soe.created_at DESC`,
       [scanType, warehouseId]
     );
+
+    let rows = eventRows;
+
+    if (scanType === SCAN_TYPES.ACTUAL_SALE) {
+      const salesColumns = await getTableColumns(connection, 'sales');
+      const salesSerialColumn = chooseExistingColumn(salesColumns, ['serial_number', 'serial']);
+      const salesInvoiceTypeColumn = chooseExistingColumn(salesColumns, ['invoice_type']);
+      const salesInvoiceNumberColumn = chooseExistingColumn(salesColumns, ['invoice_number', 'invoice_no']);
+      const salesClientColumn = chooseExistingColumn(salesColumns, ['client_name', 'client']);
+      const salesPaymentColumn = chooseExistingColumn(salesColumns, ['payment_status', 'status']);
+      const salesCreatedAtColumn = chooseExistingColumn(salesColumns, ['created_at', 'date_sold', 'sale_date', 'date', 'scanned_at']);
+
+      if (salesSerialColumn) {
+        const [salesFallbackRows] = await connection.query(
+          `SELECT
+             CONCAT('sales-', COALESCE(s.id, s.\`${salesSerialColumn}\`)) AS id,
+             u.id AS unit_id,
+             u.model_id AS model_id,
+             s.\`${salesSerialColumn}\` AS serial_number,
+             'ACTUAL_SALE' AS scan_type,
+             ${salesInvoiceTypeColumn ? `s.\`${salesInvoiceTypeColumn}\`` : 'NULL'} AS invoice_type,
+             ${salesInvoiceNumberColumn ? `s.\`${salesInvoiceNumberColumn}\`` : 'NULL'} AS invoice_number,
+             NULL AS io_number,
+             NULL AS po_number,
+             ${salesClientColumn ? `s.\`${salesClientColumn}\`` : 'NULL'} AS client_name,
+             ${salesPaymentColumn ? `s.\`${salesPaymentColumn}\`` : "'UNPAID_TFFW'"} AS payment_status,
+             'sales' AS source_table,
+             'SOLD' AS status,
+             NULL AS scanned_by,
+             ${salesCreatedAtColumn ? `s.\`${salesCreatedAtColumn}\`` : 'NOW()'} AS scanned_at,
+             ${salesCreatedAtColumn ? `s.\`${salesCreatedAtColumn}\`` : 'NOW()'} AS created_at,
+             u.warehouse_id AS warehouse_id
+           FROM sales s
+           LEFT JOIN units u ON u.serial_number = s.\`${salesSerialColumn}\`
+           WHERE u.warehouse_id = ?
+             AND NOT EXISTS (
+               SELECT 1
+               FROM scan_out_events soe
+               WHERE soe.scan_type = 'ACTUAL_SALE'
+                 AND soe.serial_number = s.\`${salesSerialColumn}\`
+             )
+           ORDER BY ${salesCreatedAtColumn ? `s.\`${salesCreatedAtColumn}\`` : 's.id'} DESC`,
+          [warehouseId]
+        );
+
+        rows = [...eventRows, ...salesFallbackRows];
+      }
+    }
 
     res.json({ rows });
   } catch (error) {
