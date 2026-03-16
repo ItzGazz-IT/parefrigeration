@@ -199,6 +199,7 @@ const buildInsertFromLogicalFields = async (connection, tableName, dataByLogical
     const match = chooseExistingColumn(columns, {
       unitId: ['unit_id', 'units_id'],
       modelId: ['model_id'],
+      warehouseId: ['warehouse_id'],
       serialNumber: ['serial_number', 'serial'],
       scanType: ['scan_type', 'sale_type', 'type'],
       invoiceType: ['invoice_type'],
@@ -244,6 +245,7 @@ const ensureScanOutEventsTable = async () => {
         id INT NOT NULL AUTO_INCREMENT,
         unit_id INT NULL,
         model_id INT NULL,
+        warehouse_id INT NULL,
         serial_number VARCHAR(255) NOT NULL,
         scan_type VARCHAR(50) NOT NULL,
         invoice_type VARCHAR(50) NULL,
@@ -263,6 +265,16 @@ const ensureScanOutEventsTable = async () => {
         KEY idx_scan_out_events_serial (serial_number)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
     );
+    // Migrate existing tables that were created before warehouse_id was added
+    const [cols] = await connection.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'scan_out_events' AND COLUMN_NAME = 'warehouse_id'`
+    );
+    if (!cols.length) {
+      await connection.query(
+        `ALTER TABLE scan_out_events ADD COLUMN warehouse_id INT NULL AFTER model_id`
+      );
+    }
   } finally {
     connection.release();
   }
@@ -1161,7 +1173,7 @@ app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', asyn
        LEFT JOIN units u ON u.id = soe.unit_id
        LEFT JOIN units us ON us.serial_number = soe.serial_number
        WHERE soe.scan_type = ?
-         AND COALESCE(u.warehouse_id, us.warehouse_id) = ?
+         AND COALESCE(soe.warehouse_id, u.warehouse_id, us.warehouse_id) = ?
        ORDER BY soe.created_at DESC`,
       [scanType, warehouseId]
     );
@@ -1859,7 +1871,7 @@ app.post('/api/scanout/process', async (req, res) => {
     await connection.beginTransaction();
 
     const [unitRows] = await connection.query(
-      'SELECT id, model_id, serial_number, status FROM units WHERE serial_number = ? LIMIT 1 FOR UPDATE',
+      'SELECT id, model_id, warehouse_id, serial_number, status FROM units WHERE serial_number = ? LIMIT 1 FOR UPDATE',
       [serialNumber]
     );
 
@@ -1875,6 +1887,7 @@ app.post('/api/scanout/process', async (req, res) => {
     const eventPayload = {
       unit_id: unit.id,
       model_id: unit.model_id || null,
+      warehouse_id: unit.warehouse_id || null,
       serial_number: unit.serial_number,
       scan_type: scanType,
       invoice_type: invoiceType || null,
@@ -1912,6 +1925,7 @@ app.post('/api/scanout/process', async (req, res) => {
     const eventInsertResult = await buildInsertFromLogicalFields(connection, 'scan_out_events', {
       unitId: eventPayload.unit_id,
       modelId: eventPayload.model_id,
+      warehouseId: eventPayload.warehouse_id,
       serialNumber: eventPayload.serial_number,
       scanType: eventPayload.scan_type,
       invoiceType: eventPayload.invoice_type,
@@ -1932,13 +1946,42 @@ app.post('/api/scanout/process', async (req, res) => {
       : null;
 
     if (AUTO_ARCHIVE_SCAN_TYPES.has(scanType) && String(ioNumber || '').trim()) {
+      const normalizedAutoIo = String(ioNumber || '').trim();
+
       await insertArchiveRecordIfMissing(connection, {
         serialNumber: eventPayload.serial_number,
         scanType: eventPayload.scan_type,
-        ioNumber: String(ioNumber || '').trim(),
+        ioNumber: normalizedAutoIo,
         sourceEventId: eventInsertId,
         clientName: eventPayload.client_name,
       });
+
+      // Update units and source table with io_number, payment_status, and supplier_status
+      const autoArchiveSourceTable = {
+        [SCAN_TYPES.TFFW_EXCHANGE]: 'tffw_exchanges',
+        [SCAN_TYPES.TFF_DEALER]: 'tff_dealer_scans',
+      }[scanType];
+
+      for (const tbl of ['units', autoArchiveSourceTable].filter(Boolean)) {
+        const tblColumns = await getTableColumns(connection, tbl);
+        const tblSerial = chooseExistingColumn(tblColumns, ['serial_number', 'serial']);
+        if (!tblSerial) continue;
+        const tblIo = chooseExistingColumn(tblColumns, ['io_number', 'io_no']);
+        const tblPayment = chooseExistingColumn(tblColumns, ['payment_status']);
+        const tblSupplier = chooseExistingColumn(tblColumns, ['supplier_status']);
+        const sets = [];
+        const vals = [];
+        if (tblIo) { sets.push(`\`${tblIo}\` = ?`); vals.push(normalizedAutoIo); }
+        if (tblPayment) { sets.push(`\`${tblPayment}\` = 'PAID_TFFW'`); }
+        if (tblSupplier) { sets.push(`\`${tblSupplier}\` = 'PAID'`); }
+        if (sets.length) {
+          vals.push(eventPayload.serial_number);
+          await connection.query(
+            `UPDATE \`${tbl}\` SET ${sets.join(', ')} WHERE \`${tblSerial}\` = ?`,
+            vals
+          );
+        }
+      }
     }
 
     await logUnitHistoryIfAvailable(connection, eventPayload);
