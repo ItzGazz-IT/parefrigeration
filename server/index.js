@@ -1452,18 +1452,42 @@ app.get('/api/dashboard/weekly-report', async (_req, res) => {
 app.get('/api/dashboard/archive', async (_req, res) => {
   const connection = await pool.getConnection();
   try {
+    const [salesColumns, unitColumns] = await Promise.all([
+      getTableColumns(connection, 'sales'),
+      getTableColumns(connection, 'units'),
+    ]);
+
+    const salesSerialColumn = chooseExistingColumn(salesColumns, ['serial_number', 'serial']);
+    const salesClientColumn = chooseExistingColumn(salesColumns, ['client_name', 'client']);
+    const salesPaymentColumn = chooseExistingColumn(salesColumns, ['payment_status', 'status']);
+    const salesSupplierStatusColumn = chooseExistingColumn(salesColumns, ['supplier_status']);
+    const salesIoColumn = chooseExistingColumn(salesColumns, ['io_number', 'io_no']);
+    const salesDateColumn = chooseExistingColumn(salesColumns, ['created_at', 'date_sold', 'sale_date', 'date', 'scanned_at']);
+
+    const unitsSupplierStatusColumn = chooseExistingColumn(unitColumns, ['supplier_status']);
+
     const [rows] = await connection.query(
       `SELECT
-         id,
-         serial_number,
-         scan_type,
-         io_number,
-         client_name,
-         source_event_id,
-         archived_at,
-         created_at
-       FROM archive_records
-       ORDER BY archived_at DESC, id DESC`
+         ar.id,
+         ar.serial_number,
+         ar.scan_type,
+         ar.io_number,
+         COALESCE(e.client_name, ar.client_name, ${salesClientColumn ? `s.\`${salesClientColumn}\`` : 'NULL'}) AS client_name,
+         COALESCE(e.payment_status, ${salesPaymentColumn ? `s.\`${salesPaymentColumn}\`` : 'NULL'}) AS payment_status,
+         COALESCE(${unitsSupplierStatusColumn ? `u.\`${unitsSupplierStatusColumn}\`` : 'NULL'}, ${salesSupplierStatusColumn ? `s.\`${salesSupplierStatusColumn}\`` : 'NULL'}) AS supplier_status,
+         COALESCE(e.io_number, ${salesIoColumn ? `s.\`${salesIoColumn}\`` : 'NULL'}, ar.io_number) AS uploaded_io_number,
+         e.invoice_type,
+         e.invoice_number,
+         e.po_number,
+         COALESCE(e.created_at, ${salesDateColumn ? `s.\`${salesDateColumn}\`` : 'NULL'}, ar.created_at) AS scanned_at,
+         ar.source_event_id,
+         ar.archived_at,
+         ar.created_at
+       FROM archive_records ar
+       LEFT JOIN scan_out_events e ON e.id = ar.source_event_id
+       LEFT JOIN units u ON u.serial_number = ar.serial_number
+       ${salesSerialColumn ? `LEFT JOIN sales s ON s.\`${salesSerialColumn}\` = ar.serial_number` : 'LEFT JOIN sales s ON 1=0'}
+       ORDER BY ar.archived_at DESC, ar.id DESC`
     );
 
     res.json({ rows });
@@ -1529,15 +1553,36 @@ app.post('/api/dashboard/weekly-report/archive-item', async (req, res) => {
     const salesColumns = await getTableColumns(connection, 'sales');
     const salesSerialColumn = chooseExistingColumn(salesColumns, ['serial_number', 'serial']);
     const salesIoColumn = chooseExistingColumn(salesColumns, ['io_number', 'io_no']);
+    const salesPaymentColumn = chooseExistingColumn(salesColumns, ['payment_status', 'status']);
+    const salesSupplierStatusColumn = chooseExistingColumn(salesColumns, ['supplier_status']);
     const salesClientColumn = chooseExistingColumn(salesColumns, ['client_name', 'client']);
 
-    if (normalizedScanType === SCAN_TYPES.ACTUAL_SALE && salesSerialColumn && salesIoColumn) {
-      await connection.query(
-        `UPDATE sales
-         SET \`${salesIoColumn}\` = ?
-         WHERE \`${salesSerialColumn}\` = ?`,
-        [normalizedIoNumber, normalizedSerialNumber]
-      );
+    if (salesSerialColumn) {
+      const salesUpdateFragments = [];
+      const salesUpdateValues = [];
+
+      if (salesIoColumn) {
+        salesUpdateFragments.push(`\`${salesIoColumn}\` = ?`);
+        salesUpdateValues.push(normalizedIoNumber);
+      }
+
+      if (salesPaymentColumn) {
+        salesUpdateFragments.push(`\`${salesPaymentColumn}\` = 'PAID_TFFW'`);
+      }
+
+      if (salesSupplierStatusColumn) {
+        salesUpdateFragments.push(`\`${salesSupplierStatusColumn}\` = 'PAID'`);
+      }
+
+      if (salesUpdateFragments.length) {
+        salesUpdateValues.push(normalizedSerialNumber);
+        await connection.query(
+          `UPDATE sales
+           SET ${salesUpdateFragments.join(', ')}
+           WHERE \`${salesSerialColumn}\` = ?`,
+          salesUpdateValues
+        );
+      }
 
       if (!clientName && salesClientColumn) {
         const [salesRows] = await connection.query(
