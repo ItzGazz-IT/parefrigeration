@@ -1552,11 +1552,67 @@ app.post('/api/dashboard/weekly-report/archive-item', async (req, res) => {
 
       await connection.query(
         `UPDATE scan_out_events
-         SET io_number = ?
+         SET io_number = ?,
+             payment_status = 'PAID_TFFW'
          WHERE id = ?`,
         [normalizedIoNumber, eventId]
       );
     }
+
+    const sourceTableByScanType = {
+      [SCAN_TYPES.ACTUAL_SALE]: 'sales',
+      [SCAN_TYPES.TFFW_EXCHANGE]: 'tffw_exchanges',
+      [SCAN_TYPES.TFF_DEALER]: 'tff_dealer_scans',
+      [SCAN_TYPES.INHOUSE_EXCHANGE]: 'inhouse_exchanges',
+      [SCAN_TYPES.TAKEALOT]: 'takealot_scans',
+    };
+
+    const updateTableBySerial = async (tableName, options = {}) => {
+      if (!tableName) {
+        return;
+      }
+
+      const columns = await getTableColumns(connection, tableName);
+      const serialColumn = chooseExistingColumn(columns, ['serial_number', 'serial']);
+      if (!serialColumn) {
+        return;
+      }
+
+      const ioColumn = chooseExistingColumn(columns, ['io_number', 'io_no']);
+      const paymentColumn = chooseExistingColumn(columns, ['payment_status']);
+      const supplierStatusColumn = chooseExistingColumn(columns, ['supplier_status']);
+
+      const updates = [];
+      const values = [];
+
+      if (ioColumn) {
+        updates.push(`\`${ioColumn}\` = ?`);
+        values.push(normalizedIoNumber);
+      }
+
+      if (paymentColumn) {
+        updates.push(`\`${paymentColumn}\` = 'PAID_TFFW'`);
+      }
+
+      if (options.updateSupplierStatus && supplierStatusColumn) {
+        updates.push(`\`${supplierStatusColumn}\` = 'PAID_TFFW'`);
+      }
+
+      if (!updates.length) {
+        return;
+      }
+
+      values.push(normalizedSerialNumber);
+      await connection.query(
+        `UPDATE \`${tableName}\`
+         SET ${updates.join(', ')}
+         WHERE \`${serialColumn}\` = ?`,
+        values
+      );
+    };
+
+    await updateTableBySerial('units', { updateSupplierStatus: true });
+    await updateTableBySerial(sourceTableByScanType[normalizedScanType], { updateSupplierStatus: true });
 
     const salesColumns = await getTableColumns(connection, 'sales');
     const salesSerialColumn = chooseExistingColumn(salesColumns, ['serial_number', 'serial']);
