@@ -778,6 +778,11 @@ app.post('/api/dashboard/quarantine/release', async (req, res) => {
     const updateStatements = ['`stock_type` = ?'];
     const updateValues = [nextStockType];
 
+    if (unitColumns.has('status')) {
+      updateStatements.push('`status` = ?');
+      updateValues.push('TFFW_Exchange');
+    }
+
     if (unitColumns.has('source_id')) {
       updateStatements.push('`source_id` = 4');
     }
