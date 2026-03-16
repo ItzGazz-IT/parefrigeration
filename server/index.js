@@ -113,7 +113,7 @@ const getTableRows = async (tableName) => {
   }
 };
 
-const getUnitsRows = async (sourceId = null, warehouseId = null) => {
+const getUnitsRows = async (sourceId = null, warehouseId = null, options = {}) => {
   const [modelColumns, unitColumns] = await Promise.all([
     pool.query(
     `SELECT COLUMN_NAME
@@ -152,6 +152,7 @@ const getUnitsRows = async (sourceId = null, warehouseId = null) => {
 
   const conditions = [];
   const queryParams = [];
+  const inStockOnly = options?.inStockOnly === true;
   if (sourceId !== null && hasSourceId) {
     conditions.push('u.source_id = ?');
     queryParams.push(sourceId);
@@ -159,6 +160,13 @@ const getUnitsRows = async (sourceId = null, warehouseId = null) => {
   if (warehouseId !== null && hasWarehouseId) {
     conditions.push('u.warehouse_id = ?');
     queryParams.push(warehouseId);
+  }
+  if (inStockOnly) {
+    if (hasSupplierStatus) {
+      conditions.push("REPLACE(UPPER(TRIM(COALESCE(u.supplier_status, ''))), ' ', '_') = 'IN_STOCK'");
+    } else if (hasStockStatus) {
+      conditions.push("REPLACE(UPPER(TRIM(COALESCE(u.stock_status, ''))), ' ', '_') = 'IN_STOCK'");
+    }
   }
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
@@ -829,19 +837,29 @@ app.get('/api/dashboard/warehouse-breakdown', async (_req, res) => {
     const unitWarehouseColumn = chooseExistingColumn(unitColumns, ['warehouse_id', 'warehouse', 'warehouse_name']);
     const warehouseIdColumn = chooseExistingColumn(warehouseColumns, ['id', 'warehouse_id']);
     const warehouseNameColumn = chooseExistingColumn(warehouseColumns, ['name', 'warehouse_name', 'warehouse', 'title']);
+    const unitSupplierStatusColumn = chooseExistingColumn(unitColumns, ['supplier_status']);
+    const unitStockStatusColumn = chooseExistingColumn(unitColumns, ['stock_status']);
 
     if (!unitWarehouseColumn) {
       return res.json({ rows: [] });
     }
 
+    const inStockCondition = unitSupplierStatusColumn
+      ? `REPLACE(UPPER(TRIM(COALESCE(u.\`${unitSupplierStatusColumn}\`, ''))), ' ', '_') = 'IN_STOCK'`
+      : (unitStockStatusColumn
+        ? `REPLACE(UPPER(TRIM(COALESCE(u.\`${unitStockStatusColumn}\`, ''))), ' ', '_') = 'IN_STOCK'`
+        : '1=1');
+
     if (warehouseIdColumn && warehouseNameColumn && unitWarehouseColumn === 'warehouse_id') {
       const [rows] = await connection.query(
         `SELECT
+           w.\`${warehouseIdColumn}\` AS warehouse_id,
            COALESCE(w.\`${warehouseNameColumn}\`, 'Unassigned') AS warehouse,
            COUNT(*) AS total_units
          FROM units u
          LEFT JOIN warehouses w ON w.\`${warehouseIdColumn}\` = u.\`${unitWarehouseColumn}\`
-         GROUP BY COALESCE(w.\`${warehouseNameColumn}\`, 'Unassigned')
+         WHERE ${inStockCondition}
+         GROUP BY w.\`${warehouseIdColumn}\`, COALESCE(w.\`${warehouseNameColumn}\`, 'Unassigned')
          ORDER BY total_units DESC, warehouse ASC`
       );
 
@@ -850,9 +868,11 @@ app.get('/api/dashboard/warehouse-breakdown', async (_req, res) => {
 
     const [rows] = await connection.query(
       `SELECT
+         NULL AS warehouse_id,
          COALESCE(NULLIF(TRIM(CAST(u.\`${unitWarehouseColumn}\` AS CHAR)), ''), 'Unassigned') AS warehouse,
          COUNT(*) AS total_units
        FROM units u
+       WHERE ${inStockCondition}
        GROUP BY COALESCE(NULLIF(TRIM(CAST(u.\`${unitWarehouseColumn}\` AS CHAR)), ''), 'Unassigned')
        ORDER BY total_units DESC, warehouse ASC`
     );
@@ -863,6 +883,21 @@ app.get('/api/dashboard/warehouse-breakdown', async (_req, res) => {
     return res.status(500).json({ error: 'Failed to load warehouse breakdown' });
   } finally {
     connection.release();
+  }
+});
+
+app.get('/api/dashboard/units-in-stock-by-warehouse/:warehouseId', async (req, res) => {
+  try {
+    const warehouseId = Number.parseInt(req.params.warehouseId, 10);
+    if (Number.isNaN(warehouseId)) {
+      return res.status(400).json({ error: 'Invalid warehouseId' });
+    }
+
+    const rows = await getUnitsRows(null, warehouseId, { inStockOnly: true });
+    return res.json({ rows });
+  } catch (error) {
+    console.error('Units in stock by warehouse query failed:', error);
+    return res.status(500).json({ error: 'Failed to load units in stock by warehouse' });
   }
 });
 

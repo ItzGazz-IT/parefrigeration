@@ -93,7 +93,7 @@ function App() {
 
   const staticPageMeta = useMemo(
     () => ({
-      dashboard: { title: 'Dashboard', component: <Dashboard /> },
+      dashboard: { title: 'Dashboard', component: <Dashboard onNavigate={setActivePage} /> },
       units: { title: 'Units', component: <UnitsPage /> },
       sales: { title: 'Sales', component: <SalesPage /> },
       exchanges: { title: 'Exchanges', component: <ExchangesPage /> },
@@ -138,6 +138,27 @@ function App() {
             subtitle={`Units in ${warehouseName} from ${sourceName}`}
             rowFilter={sourceSpecificFilter}
             hiddenColumns={['stock_status', 'source_id', 'date_received', 'created_at']}
+          />
+        ),
+      };
+    }
+
+    const warehouseStockMatch = activePage.match(/^warehouse-(\d+)-instock$/);
+    if (warehouseStockMatch) {
+      const warehouseId = parseInt(warehouseStockMatch[1], 10);
+      const warehouse = warehouses.find((w) => w.id === warehouseId);
+      const warehouseName = warehouse?.name || warehouse?.warehouse_name || warehouse?.warehouse || warehouse?.title || `Warehouse ${warehouseId}`;
+      const title = `${warehouseName} – Units In Stock`;
+
+      return {
+        title,
+        component: (
+          <DataTablePage
+            key={activePage}
+            title={title}
+            endpoint={`/api/dashboard/units-in-stock-by-warehouse/${warehouseId}`}
+            subtitle={`Units currently in stock at ${warehouseName}`}
+            hiddenColumns={['source_id', 'date_received', 'created_at', 'delivered']}
           />
         ),
       };
