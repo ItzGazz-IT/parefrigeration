@@ -55,6 +55,11 @@ const scanRules = {
   },
 };
 
+const AUTO_ARCHIVE_SCAN_TYPES = new Set([
+  SCAN_TYPES.TFFW_EXCHANGE,
+  SCAN_TYPES.TFF_DEALER,
+]);
+
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -309,6 +314,85 @@ const ensureWeeklyPaymentHistoryTable = async () => {
   } finally {
     connection.release();
   }
+};
+
+const ensureArchiveRecordsTable = async () => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.query(
+      `CREATE TABLE IF NOT EXISTS archive_records (
+        id INT NOT NULL AUTO_INCREMENT,
+        serial_number VARCHAR(255) NOT NULL,
+        scan_type VARCHAR(50) NOT NULL,
+        io_number VARCHAR(100) NOT NULL,
+        source_event_id INT NULL,
+        client_name VARCHAR(255) NULL,
+        archived_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uniq_archive_source_event (source_event_id),
+        KEY idx_archive_serial_scan (serial_number, scan_type),
+        KEY idx_archive_archived_at (archived_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+    );
+  } finally {
+    connection.release();
+  }
+};
+
+const insertArchiveRecordIfMissing = async (connection, payload) => {
+  const normalizedSerialNumber = String(payload?.serialNumber || '').trim();
+  const normalizedScanType = String(payload?.scanType || '').trim().toUpperCase();
+  const normalizedIoNumber = String(payload?.ioNumber || '').trim();
+  const sourceEventId = Number.isInteger(payload?.sourceEventId) ? payload.sourceEventId : null;
+
+  if (!normalizedSerialNumber || !normalizedScanType || !normalizedIoNumber) {
+    return false;
+  }
+
+  if (sourceEventId) {
+    const [existingByEvent] = await connection.query(
+      'SELECT id FROM archive_records WHERE source_event_id = ? LIMIT 1',
+      [sourceEventId]
+    );
+
+    if (existingByEvent.length) {
+      return false;
+    }
+  } else {
+    const [existingByComposite] = await connection.query(
+      `SELECT id
+       FROM archive_records
+       WHERE serial_number = ? AND scan_type = ? AND io_number = ?
+       LIMIT 1`,
+      [normalizedSerialNumber, normalizedScanType, normalizedIoNumber]
+    );
+
+    if (existingByComposite.length) {
+      return false;
+    }
+  }
+
+  await connection.query(
+    `INSERT INTO archive_records (
+      serial_number,
+      scan_type,
+      io_number,
+      source_event_id,
+      client_name,
+      archived_at,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, NOW(), NOW())`,
+    [
+      normalizedSerialNumber,
+      normalizedScanType,
+      normalizedIoNumber,
+      sourceEventId,
+      payload?.clientName || null,
+    ]
+  );
+
+  return true;
 };
 
 const validateScanPayload = (payload) => {
@@ -1200,13 +1284,18 @@ app.get('/api/dashboard/weekly-report', async (_req, res) => {
   try {
     const [eventSummaryRows] = await connection.query(
       `SELECT
-         scan_type,
-         payment_status,
+         e.scan_type,
          COUNT(*) AS total
-       FROM scan_out_events
-       WHERE include_weekly_report = 1
-         AND YEARWEEK(created_at, 1) = YEARWEEK(CURDATE(), 1)
-       GROUP BY scan_type, payment_status
+       FROM scan_out_events e
+       WHERE e.include_weekly_report = 1
+         AND YEARWEEK(e.created_at, 1) = YEARWEEK(CURDATE(), 1)
+         AND NOT EXISTS (
+           SELECT 1
+           FROM archive_records ar
+           WHERE ar.source_event_id = e.id
+              OR (ar.serial_number = e.serial_number AND ar.scan_type = e.scan_type)
+         )
+       GROUP BY e.scan_type
        ORDER BY total DESC`
     );
 
@@ -1226,7 +1315,7 @@ app.get('/api/dashboard/weekly-report', async (_req, res) => {
       'date',
     ]);
     const salesClientColumn = chooseExistingColumn(salesColumns, ['client_name', 'client']);
-    const salesPaymentColumn = chooseExistingColumn(salesColumns, ['payment_status', 'status']);
+    const salesIoColumn = chooseExistingColumn(salesColumns, ['io_number', 'io_no']);
     const unitsSupplierStatusColumn = chooseExistingColumn(unitColumns, ['supplier_status']);
 
     const salesCanJoinUnits = Boolean(unitsSupplierStatusColumn && salesSerialColumn && unitColumns.has('serial_number'));
@@ -1235,12 +1324,12 @@ app.get('/api/dashboard/weekly-report', async (_req, res) => {
     let salesRecentRows = [];
 
     if (salesSerialColumn) {
-      const salesPaymentSelect = salesPaymentColumn
-        ? `COALESCE(NULLIF(TRIM(CAST(s.\`${salesPaymentColumn}\` AS CHAR)), ''), '-')`
-        : "'UNSPECIFIED'";
-
       const salesClientSelect = salesClientColumn
         ? `s.\`${salesClientColumn}\``
+        : 'NULL';
+
+      const salesIoSelect = salesIoColumn
+        ? `s.\`${salesIoColumn}\``
         : 'NULL';
 
       const supplierStatusSelect = salesCanJoinUnits
@@ -1258,19 +1347,23 @@ app.get('/api/dashboard/weekly-report', async (_req, res) => {
       const [summaryRows] = await connection.query(
         `SELECT
            'ACTUAL_SALE' AS scan_type,
-           ${salesPaymentSelect} AS payment_status,
            COUNT(*) AS total
          FROM sales s
          ${unitJoin}
          WHERE ${salesWeekFilter}
            AND NOT EXISTS (
              SELECT 1
+             FROM archive_records ar
+             WHERE ar.serial_number = s.\`${salesSerialColumn}\`
+               AND ar.scan_type = 'ACTUAL_SALE'
+           )
+           AND NOT EXISTS (
+             SELECT 1
              FROM scan_out_events e
              WHERE e.scan_type = 'ACTUAL_SALE'
                AND YEARWEEK(e.created_at, 1) = YEARWEEK(CURDATE(), 1)
                AND e.serial_number = s.\`${salesSerialColumn}\`
-           )
-         GROUP BY ${salesPaymentSelect}`
+           )`
       );
       salesSummaryRows = summaryRows;
 
@@ -1283,12 +1376,18 @@ app.get('/api/dashboard/weekly-report', async (_req, res) => {
            s.\`${salesSerialColumn}\` AS serial_number,
            'ACTUAL_SALE' AS scan_type,
            ${salesClientSelect} AS client_name,
-           ${salesPaymentSelect} AS payment_status,
            ${supplierStatusSelect} AS supplier_status,
+           ${salesIoSelect} AS io_number,
            ${salesCreatedAtSelect} AS created_at
          FROM sales s
          ${unitJoin}
          WHERE ${salesWeekFilter}
+           AND NOT EXISTS (
+             SELECT 1
+             FROM archive_records ar
+             WHERE ar.serial_number = s.\`${salesSerialColumn}\`
+               AND ar.scan_type = 'ACTUAL_SALE'
+           )
            AND NOT EXISTS (
              SELECT 1
              FROM scan_out_events e
@@ -1307,13 +1406,19 @@ app.get('/api/dashboard/weekly-report', async (_req, res) => {
          e.serial_number,
          e.scan_type,
          e.client_name,
-         e.payment_status,
          ${unitsSupplierStatusColumn ? `u.\`${unitsSupplierStatusColumn}\`` : 'NULL'} AS supplier_status,
+         e.io_number,
          e.created_at
       FROM scan_out_events e
        ${unitsSupplierStatusColumn ? 'LEFT JOIN units u ON u.`serial_number` = e.serial_number' : ''}
-       WHERE include_weekly_report = 1
+       WHERE e.include_weekly_report = 1
          AND YEARWEEK(e.created_at, 1) = YEARWEEK(CURDATE(), 1)
+         AND NOT EXISTS (
+           SELECT 1
+           FROM archive_records ar
+           WHERE ar.source_event_id = e.id
+              OR (ar.serial_number = e.serial_number AND ar.scan_type = e.scan_type)
+         )
        ORDER BY e.created_at DESC
        LIMIT 25`
     );
@@ -1321,9 +1426,8 @@ app.get('/api/dashboard/weekly-report', async (_req, res) => {
     const summaryMap = new Map();
     [...eventSummaryRows, ...salesSummaryRows].forEach((row) => {
       const scanType = row.scan_type || 'UNKNOWN';
-      const paymentStatus = row.payment_status || '-';
-      const key = `${scanType}__${paymentStatus}`;
-      const current = summaryMap.get(key) || { scan_type: scanType, payment_status: paymentStatus, total: 0 };
+      const key = `${scanType}`;
+      const current = summaryMap.get(key) || { scan_type: scanType, total: 0 };
       current.total += Number(row.total || 0);
       summaryMap.set(key, current);
     });
@@ -1340,6 +1444,134 @@ app.get('/api/dashboard/weekly-report', async (_req, res) => {
   } catch (error) {
     console.error('Weekly report query failed:', error);
     res.status(500).json({ error: 'Failed to load weekly report' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.get('/api/dashboard/archive', async (_req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const [rows] = await connection.query(
+      `SELECT
+         id,
+         serial_number,
+         scan_type,
+         io_number,
+         client_name,
+         source_event_id,
+         archived_at,
+         created_at
+       FROM archive_records
+       ORDER BY archived_at DESC, id DESC`
+    );
+
+    res.json({ rows });
+  } catch (error) {
+    console.error('Archive query failed:', error);
+    res.status(500).json({ error: 'Failed to load archive rows' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post('/api/dashboard/weekly-report/archive-item', async (req, res) => {
+  const { serialNumber, scanType, ioNumber } = req.body || {};
+
+  const normalizedSerialNumber = String(serialNumber || '').trim();
+  const normalizedScanType = String(scanType || '').trim().toUpperCase();
+  const normalizedIoNumber = String(ioNumber || '').trim();
+
+  if (!normalizedSerialNumber) {
+    return res.status(400).json({ error: 'serialNumber is required' });
+  }
+
+  if (!normalizedScanType) {
+    return res.status(400).json({ error: 'scanType is required' });
+  }
+
+  if (!normalizedIoNumber) {
+    return res.status(400).json({ error: 'ioNumber is required' });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [eventRows] = await connection.query(
+      `SELECT id, serial_number, scan_type, client_name
+       FROM scan_out_events
+       WHERE serial_number = ?
+         AND scan_type = ?
+         AND include_weekly_report = 1
+         AND YEARWEEK(created_at, 1) = YEARWEEK(CURDATE(), 1)
+       ORDER BY created_at DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [normalizedSerialNumber, normalizedScanType]
+    );
+
+    let eventId = null;
+    let clientName = null;
+
+    if (eventRows.length) {
+      eventId = eventRows[0].id;
+      clientName = eventRows[0].client_name || null;
+
+      await connection.query(
+        `UPDATE scan_out_events
+         SET io_number = ?
+         WHERE id = ?`,
+        [normalizedIoNumber, eventId]
+      );
+    }
+
+    const salesColumns = await getTableColumns(connection, 'sales');
+    const salesSerialColumn = chooseExistingColumn(salesColumns, ['serial_number', 'serial']);
+    const salesIoColumn = chooseExistingColumn(salesColumns, ['io_number', 'io_no']);
+    const salesClientColumn = chooseExistingColumn(salesColumns, ['client_name', 'client']);
+
+    if (normalizedScanType === SCAN_TYPES.ACTUAL_SALE && salesSerialColumn && salesIoColumn) {
+      await connection.query(
+        `UPDATE sales
+         SET \`${salesIoColumn}\` = ?
+         WHERE \`${salesSerialColumn}\` = ?`,
+        [normalizedIoNumber, normalizedSerialNumber]
+      );
+
+      if (!clientName && salesClientColumn) {
+        const [salesRows] = await connection.query(
+          `SELECT \`${salesClientColumn}\` AS client_name
+           FROM sales
+           WHERE \`${salesSerialColumn}\` = ?
+           ORDER BY id DESC
+           LIMIT 1`,
+          [normalizedSerialNumber]
+        );
+        clientName = salesRows[0]?.client_name || null;
+      }
+    }
+
+    await insertArchiveRecordIfMissing(connection, {
+      serialNumber: normalizedSerialNumber,
+      scanType: normalizedScanType,
+      ioNumber: normalizedIoNumber,
+      sourceEventId: eventId,
+      clientName,
+    });
+
+    await connection.commit();
+    return res.json({
+      ok: true,
+      serialNumber: normalizedSerialNumber,
+      scanType: normalizedScanType,
+      ioNumber: normalizedIoNumber,
+      archived: true,
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Archive item from weekly report failed:', error);
+    return res.status(500).json({ error: 'Failed to archive weekly report item' });
   } finally {
     connection.release();
   }
@@ -1579,6 +1811,20 @@ app.post('/api/scanout/process', async (req, res) => {
       createdAt: eventPayload.created_at,
     });
 
+    const eventInsertId = Number.isInteger(eventInsertResult?.insertId)
+      ? eventInsertResult.insertId
+      : null;
+
+    if (AUTO_ARCHIVE_SCAN_TYPES.has(scanType) && String(ioNumber || '').trim()) {
+      await insertArchiveRecordIfMissing(connection, {
+        serialNumber: eventPayload.serial_number,
+        scanType: eventPayload.scan_type,
+        ioNumber: String(ioNumber || '').trim(),
+        sourceEventId: eventInsertId,
+        clientName: eventPayload.client_name,
+      });
+    }
+
     await logUnitHistoryIfAvailable(connection, eventPayload);
     await connection.commit();
 
@@ -1610,6 +1856,10 @@ ensureRareCaseStockChangesTable().catch((error) => {
 
 ensureWeeklyPaymentHistoryTable().catch((error) => {
   console.error('Could not ensure weekly_payment_history table:', error.message);
+});
+
+ensureArchiveRecordsTable().catch((error) => {
+  console.error('Could not ensure archive_records table:', error.message);
 });
 
 if (fs.existsSync(buildIndexPath)) {
