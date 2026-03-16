@@ -407,6 +407,87 @@ const insertArchiveRecordIfMissing = async (connection, payload) => {
   return true;
 };
 
+const syncTffwExchangeFromSource = async (connection) => {
+  const sourceColumns = await getTableColumns(connection, 'tffw_exchanges');
+  const serialColumn = chooseExistingColumn(sourceColumns, ['serial_number', 'serial']);
+  if (!serialColumn) {
+    return 0;
+  }
+
+  const modelColumn = chooseExistingColumn(sourceColumns, ['model_id']);
+  const warehouseColumn = chooseExistingColumn(sourceColumns, ['warehouse_id']);
+  const clientColumn = chooseExistingColumn(sourceColumns, ['client_name', 'client']);
+  const ioColumn = chooseExistingColumn(sourceColumns, ['io_number', 'io_no']);
+  const createdAtColumn = chooseExistingColumn(sourceColumns, ['timestamp', 'created_at', 'scanned_at', 'date']);
+
+  const [missingRows] = await connection.query(
+    `SELECT
+       s.\`${serialColumn}\` AS serial_number,
+       ${modelColumn ? `s.\`${modelColumn}\`` : 'NULL'} AS model_id,
+       ${warehouseColumn ? `s.\`${warehouseColumn}\`` : 'NULL'} AS warehouse_id,
+       ${clientColumn ? `s.\`${clientColumn}\`` : 'NULL'} AS client_name,
+       ${ioColumn ? `s.\`${ioColumn}\`` : 'NULL'} AS io_number,
+       ${createdAtColumn ? `s.\`${createdAtColumn}\`` : 'NOW()'} AS source_created_at
+     FROM tffw_exchanges s
+     WHERE s.\`${serialColumn}\` IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1
+         FROM scan_out_events e
+         WHERE e.scan_type = 'TFFW_EXCHANGE'
+           AND e.serial_number = s.\`${serialColumn}\`
+       )
+     ORDER BY ${createdAtColumn ? `s.\`${createdAtColumn}\`` : 's.id'} DESC`
+  );
+
+  let syncedCount = 0;
+  for (const row of missingRows) {
+    const serialNumber = String(row.serial_number || '').trim();
+    if (!serialNumber) {
+      continue;
+    }
+
+    const [unitRows] = await connection.query(
+      'SELECT id, model_id, warehouse_id FROM units WHERE serial_number = ? LIMIT 1',
+      [serialNumber]
+    );
+
+    const unit = unitRows[0] || {};
+    const eventTimestamp = row.source_created_at || new Date();
+    const ioNumber = String(row.io_number || '').trim() || null;
+
+    const insertResult = await buildInsertFromLogicalFields(connection, 'scan_out_events', {
+      unitId: unit.id || null,
+      modelId: row.model_id || unit.model_id || null,
+      warehouseId: row.warehouse_id || unit.warehouse_id || null,
+      serialNumber,
+      scanType: SCAN_TYPES.TFFW_EXCHANGE,
+      ioNumber,
+      clientName: row.client_name || null,
+      paymentStatus: ioNumber ? 'PAID_TFFW' : 'UNPAID_TFFW',
+      includeWeeklyReport: 0,
+      status: 'SOLD',
+      scannedAt: eventTimestamp,
+      createdAt: eventTimestamp,
+    });
+
+    const sourceEventId = Number.isInteger(insertResult?.insertId) ? insertResult.insertId : null;
+
+    if (ioNumber) {
+      await insertArchiveRecordIfMissing(connection, {
+        serialNumber,
+        scanType: SCAN_TYPES.TFFW_EXCHANGE,
+        ioNumber,
+        sourceEventId,
+        clientName: row.client_name || null,
+      });
+    }
+
+    syncedCount += 1;
+  }
+
+  return syncedCount;
+};
+
 const validateScanPayload = (payload) => {
   const { scanType, serialNumber } = payload;
 
@@ -1140,6 +1221,10 @@ app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', asyn
       return;
     }
 
+    if (scanType === SCAN_TYPES.TFFW_EXCHANGE) {
+      await syncTffwExchangeFromSource(connection);
+    }
+
     const unitColumns = await getTableColumns(connection, 'units');
     if (!unitColumns.has('warehouse_id')) {
       res.json({ rows: [] });
@@ -1480,6 +1565,8 @@ app.get('/api/dashboard/weekly-report', async (_req, res) => {
 app.get('/api/dashboard/archive', async (_req, res) => {
   const connection = await pool.getConnection();
   try {
+    await syncTffwExchangeFromSource(connection);
+
     const [salesColumns, unitColumns] = await Promise.all([
       getTableColumns(connection, 'sales'),
       getTableColumns(connection, 'units'),
