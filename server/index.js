@@ -1169,6 +1169,7 @@ app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', asyn
       const salesSerialColumn = chooseExistingColumn(salesColumns, ['serial_number', 'serial']);
       const salesInvoiceTypeColumn = chooseExistingColumn(salesColumns, ['invoice_type']);
       const salesInvoiceNumberColumn = chooseExistingColumn(salesColumns, ['invoice_number', 'invoice_no']);
+      const salesIoColumn = chooseExistingColumn(salesColumns, ['io_number', 'io_no']);
       const salesClientColumn = chooseExistingColumn(salesColumns, ['client_name', 'client']);
       const salesPaymentColumn = chooseExistingColumn(salesColumns, ['payment_status', 'status']);
       const salesCreatedAtColumn = chooseExistingColumn(salesColumns, ['created_at', 'date_sold', 'sale_date', 'date', 'scanned_at']);
@@ -1183,7 +1184,7 @@ app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', asyn
              'ACTUAL_SALE' AS scan_type,
              ${salesInvoiceTypeColumn ? `s.\`${salesInvoiceTypeColumn}\`` : 'NULL'} AS invoice_type,
              ${salesInvoiceNumberColumn ? `s.\`${salesInvoiceNumberColumn}\`` : 'NULL'} AS invoice_number,
-             NULL AS io_number,
+             ${salesIoColumn ? `s.\`${salesIoColumn}\`` : 'NULL'} AS io_number,
              NULL AS po_number,
              ${salesClientColumn ? `s.\`${salesClientColumn}\`` : 'NULL'} AS client_name,
              ${salesPaymentColumn ? `s.\`${salesPaymentColumn}\`` : "'UNPAID_TFFW'"} AS payment_status,

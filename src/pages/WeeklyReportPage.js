@@ -29,14 +29,15 @@ const getCountByScanType = (summaryRows, scanType) => {
 const WeeklyReportPage = () => {
   const [summaryRows, setSummaryRows] = useState([]);
   const [recentRows, setRecentRows] = useState([]);
+  const [historyRows, setHistoryRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
-  const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
+  const [markPaidDialogOpen, setMarkPaidDialogOpen] = useState(false);
   const [selectedRow, setSelectedRow] = useState(null);
   const [ioNumberInput, setIoNumberInput] = useState('');
-  const [archiveError, setArchiveError] = useState('');
-  const [archiveLoading, setArchiveLoading] = useState(false);
+  const [markPaidError, setMarkPaidError] = useState('');
+  const [markPaidLoading, setMarkPaidLoading] = useState(false);
 
   useEffect(() => {
     const loadWeeklyReport = async () => {
@@ -47,11 +48,12 @@ const WeeklyReportPage = () => {
 
         const [reportResponse, historyResponse] = await Promise.all([
           apiGet('/api/dashboard/weekly-report'),
-          Promise.resolve({ data: {} }),
+          apiGet('/api/dashboard/weekly-report-payment-history'),
         ]);
 
         setSummaryRows(reportResponse.data?.summary || []);
         setRecentRows(reportResponse.data?.recent || []);
+        setHistoryRows(historyResponse.data?.rows || []);
       } catch (requestError) {
         setError('Unable to load weekly report data from the API.');
       } finally {
@@ -67,10 +69,14 @@ const WeeklyReportPage = () => {
       setLoading(true);
       setError('');
 
-      const reportResponse = await apiGet('/api/dashboard/weekly-report');
+      const [reportResponse, historyResponse] = await Promise.all([
+        apiGet('/api/dashboard/weekly-report'),
+        apiGet('/api/dashboard/weekly-report-payment-history'),
+      ]);
 
       setSummaryRows(reportResponse.data?.summary || []);
       setRecentRows(reportResponse.data?.recent || []);
+      setHistoryRows(historyResponse.data?.rows || []);
     } catch (_error) {
       setError('Unable to load weekly report data from the API.');
     } finally {
@@ -78,56 +84,56 @@ const WeeklyReportPage = () => {
     }
   };
 
-  const openArchiveDialog = (row) => {
+  const openMarkPaidDialog = (row) => {
     setSelectedRow(row);
-    setIoNumberInput(String(row?.io_number || '').trim());
-    setArchiveError('');
-    setArchiveDialogOpen(true);
+    setIoNumberInput('');
+    setMarkPaidError('');
+    setMarkPaidDialogOpen(true);
   };
 
-  const closeArchiveDialog = (forceClose = false) => {
-    if (archiveLoading && !forceClose) {
+  const closeMarkPaidDialog = (forceClose = false) => {
+    if (markPaidLoading && !forceClose) {
       return;
     }
 
-    setArchiveDialogOpen(false);
+    setMarkPaidDialogOpen(false);
     setSelectedRow(null);
     setIoNumberInput('');
-    setArchiveError('');
+    setMarkPaidError('');
   };
 
-  const handleConfirmArchive = async () => {
+  const handleConfirmMarkPaid = async () => {
     const normalizedIoNumber = String(ioNumberInput || '').trim();
     if (!normalizedIoNumber) {
-      setArchiveError('IO number is required.');
+      setMarkPaidError('IO number is required.');
       return;
     }
 
     if (!selectedRow?.serial_number) {
-      setArchiveError('Selected row is missing a serial number.');
+      setMarkPaidError('Selected row is missing a serial number.');
       return;
     }
 
     try {
-      setArchiveLoading(true);
-      setArchiveError('');
+      setMarkPaidLoading(true);
+      setMarkPaidError('');
       setError('');
       setSuccessMessage('');
 
-      await apiPost('/api/dashboard/weekly-report/archive-item', {
+      await apiPost('/api/dashboard/weekly-report/mark-paid', {
         serialNumber: selectedRow.serial_number,
-        scanType: selectedRow.scan_type || null,
         ioNumber: normalizedIoNumber,
+        scanType: selectedRow.scan_type || null,
       });
 
       await loadWeeklyReport();
-      setSuccessMessage(`Serial ${selectedRow.serial_number} moved to Archive.`);
-      closeArchiveDialog(true);
+      setSuccessMessage(`Serial ${selectedRow.serial_number} marked as PAID_TFFW.`);
+      closeMarkPaidDialog(true);
     } catch (requestError) {
       const serverError = requestError?.response?.data?.error;
-      setArchiveError(serverError || 'Failed to archive this unit.');
+      setMarkPaidError(serverError || 'Failed to mark this unit as paid.');
     } finally {
-      setArchiveLoading(false);
+      setMarkPaidLoading(false);
     }
   };
 
@@ -152,7 +158,7 @@ const WeeklyReportPage = () => {
         Weekly Report
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 3, textAlign: 'center' }}>
-        This week&apos;s scanned-out items. Upload IO per item to move the unit into Archive.
+        This week&apos;s scanned-out items, including Actual Sales and Inhouse Exchanges
       </Typography>
 
       {error && (
@@ -215,20 +221,22 @@ const WeeklyReportPage = () => {
                 <TableHead>
                   <TableRow>
                     <TableCell>Scan Type</TableCell>
+                    <TableCell>Payment Status</TableCell>
                     <TableCell align="right">Total</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
                   {!summaryRows.length ? (
                     <TableRow>
-                      <TableCell colSpan={2} align="center">
+                      <TableCell colSpan={3} align="center">
                         No weekly summary rows found.
                       </TableCell>
                     </TableRow>
                   ) : (
                     summaryRows.map((row, index) => (
-                      <TableRow key={`${row.scan_type}-${index}`} hover>
+                      <TableRow key={`${row.scan_type}-${row.payment_status}-${index}`} hover>
                         <TableCell>{row.scan_type || '-'}</TableCell>
+                        <TableCell>{row.payment_status || '-'}</TableCell>
                         <TableCell align="right">{row.total || 0}</TableCell>
                       </TableRow>
                     ))
@@ -250,6 +258,7 @@ const WeeklyReportPage = () => {
                     <TableCell>Scan Type</TableCell>
                     <TableCell>Client</TableCell>
                     <TableCell>Supplier Status</TableCell>
+                    <TableCell>Payment Status</TableCell>
                     <TableCell>IO Number</TableCell>
                     <TableCell>Scanned At</TableCell>
                     <TableCell align="right">Action</TableCell>
@@ -258,7 +267,7 @@ const WeeklyReportPage = () => {
                 <TableBody>
                   {!recentRows.length ? (
                     <TableRow>
-                      <TableCell colSpan={7} align="center">
+                      <TableCell colSpan={8} align="center">
                         No weekly scan-out entries found.
                       </TableCell>
                     </TableRow>
@@ -269,19 +278,64 @@ const WeeklyReportPage = () => {
                         <TableCell>{row.scan_type || '-'}</TableCell>
                         <TableCell>{row.client_name || '-'}</TableCell>
                         <TableCell>{row.supplier_status || '-'}</TableCell>
+                        <TableCell>{row.payment_status || '-'}</TableCell>
                         <TableCell>{row.io_number || '-'}</TableCell>
                         <TableCell>
                           {row.created_at ? new Date(row.created_at).toLocaleString() : '-'}
                         </TableCell>
                         <TableCell align="right">
-                          <Button
-                            variant="contained"
-                            size="small"
-                            onClick={() => openArchiveDialog(row)}
-                          >
-                            {row.io_number ? 'Move to Archive' : 'Upload IO'}
-                          </Button>
+                          {row.payment_status === 'UNPAID_TFFW' ? (
+                            <Button
+                              variant="contained"
+                              size="small"
+                              onClick={() => openMarkPaidDialog(row)}
+                            >
+                              Mark as Paid
+                            </Button>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">-</Typography>
+                          )}
                         </TableCell>
+                      </TableRow>
+                    ))
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          </Paper>
+
+          <Paper elevation={2}>
+            <Box sx={{ p: 2, borderBottom: '1px solid', borderColor: 'divider' }}>
+              <Typography variant="h6">Weekly Payment History</Typography>
+            </Box>
+            <TableContainer>
+              <Table size="medium">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Serial Number</TableCell>
+                    <TableCell>Scan Type</TableCell>
+                    <TableCell>Previous Status</TableCell>
+                    <TableCell>New Status</TableCell>
+                    <TableCell>IO Number</TableCell>
+                    <TableCell>Changed At</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {!historyRows.length ? (
+                    <TableRow>
+                      <TableCell colSpan={6} align="center">
+                        No payment changes logged for this week.
+                      </TableCell>
+                    </TableRow>
+                  ) : (
+                    historyRows.map((row) => (
+                      <TableRow key={row.id} hover>
+                        <TableCell>{row.serial_number || '-'}</TableCell>
+                        <TableCell>{row.scan_type || '-'}</TableCell>
+                        <TableCell>{row.previous_payment_status || '-'}</TableCell>
+                        <TableCell>{row.new_payment_status || '-'}</TableCell>
+                        <TableCell>{row.io_number || '-'}</TableCell>
+                        <TableCell>{row.changed_at ? new Date(row.changed_at).toLocaleString() : '-'}</TableCell>
                       </TableRow>
                     ))
                   )}
@@ -293,8 +347,8 @@ const WeeklyReportPage = () => {
       )}
 
       <Dialog
-        open={archiveDialogOpen}
-        onClose={closeArchiveDialog}
+        open={markPaidDialogOpen}
+        onClose={closeMarkPaidDialog}
         fullWidth
         maxWidth="sm"
         PaperProps={{
@@ -306,14 +360,14 @@ const WeeklyReportPage = () => {
         }}
       >
         <DialogTitle sx={{ textAlign: 'center', fontWeight: 700 }}>
-          Upload IO Number
+          Mark Unit as Paid
         </DialogTitle>
         <DialogContent>
           <Box sx={{ pt: 0.6, pb: 0.25, textAlign: 'center' }}>
             <Typography variant="body2" color="text.secondary">
               {selectedRow?.serial_number
-                ? `Enter IO number for serial ${selectedRow.serial_number}. This will move it to Archive.`
-                : 'Enter IO number to move this item to Archive.'}
+                ? `Enter IO number for serial ${selectedRow.serial_number}`
+                : 'Enter IO number to mark this item as paid.'}
             </Typography>
           </Box>
 
@@ -328,18 +382,18 @@ const WeeklyReportPage = () => {
             />
           </Box>
 
-          {archiveError && (
+          {markPaidError && (
             <Alert severity="error" sx={{ mt: 1.5 }}>
-              {archiveError}
+              {markPaidError}
             </Alert>
           )}
         </DialogContent>
         <DialogActions sx={{ justifyContent: 'center', pb: 2.1, px: 2.5, gap: 0.8 }}>
-          <Button variant="outlined" onClick={closeArchiveDialog} disabled={archiveLoading}>
+          <Button variant="outlined" onClick={closeMarkPaidDialog} disabled={markPaidLoading}>
             Cancel
           </Button>
-          <Button variant="contained" onClick={handleConfirmArchive} disabled={archiveLoading}>
-            {archiveLoading ? 'Saving...' : 'Confirm'}
+          <Button variant="contained" onClick={handleConfirmMarkPaid} disabled={markPaidLoading}>
+            {markPaidLoading ? 'Saving...' : 'Confirm'}
           </Button>
         </DialogActions>
       </Dialog>

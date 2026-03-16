@@ -157,6 +157,7 @@ function App() {
             title={title}
             endpoint={`/api/dashboard/scan-out-by-warehouse-type/${warehouseId}/${scanType}`}
             subtitle={`Scan-out records in ${warehouseName} for ${scanOutName}`}
+            hiddenColumns={['scanned_by', 'source_table', 'scanned_at', 'created_at']}
           />
         ),
       };
