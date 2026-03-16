@@ -1535,8 +1535,6 @@ app.post('/api/dashboard/weekly-report/archive-item', async (req, res) => {
        FROM scan_out_events
        WHERE serial_number = ?
          AND scan_type = ?
-         AND include_weekly_report = 1
-         AND YEARWEEK(created_at, 1) = YEARWEEK(CURDATE(), 1)
        ORDER BY created_at DESC
        LIMIT 1
        FOR UPDATE`,
@@ -1554,8 +1552,9 @@ app.post('/api/dashboard/weekly-report/archive-item', async (req, res) => {
         `UPDATE scan_out_events
          SET io_number = ?,
              payment_status = 'PAID_TFFW'
-         WHERE id = ?`,
-        [normalizedIoNumber, eventId]
+         WHERE serial_number = ?
+           AND scan_type = ?`,
+        [normalizedIoNumber, normalizedSerialNumber, normalizedScanType]
       );
     }
 
