@@ -946,6 +946,13 @@ app.get('/api/dashboard/rare-cases', async (_req, res) => {
     const warehouseIdSelect = unitColumnNames.has('warehouse_id') ? 'u.warehouse_id' : 'NULL';
     const sourceIdSelect = unitColumnNames.has('source_id') ? 'u.source_id' : 'NULL';
 
+    const conditions = ["UPPER(TRIM(COALESCE(u.stock_type, ''))) = 'A'"];
+    if (unitColumnNames.has('supplier_status')) {
+      conditions.push("REPLACE(UPPER(TRIM(COALESCE(u.supplier_status, ''))), ' ', '_') = 'IN_STOCK'");
+    } else if (unitColumnNames.has('stock_status')) {
+      conditions.push("REPLACE(UPPER(TRIM(COALESCE(u.stock_status, ''))), ' ', '_') = 'IN_STOCK'");
+    }
+
     const [rows] = await pool.query(
       `SELECT
          u.id,
@@ -963,7 +970,7 @@ app.get('/api/dashboard/rare-cases', async (_req, res) => {
          u.created_at
        FROM units u
        LEFT JOIN models m ON m.id = u.model_id
-       WHERE UPPER(TRIM(COALESCE(u.stock_type, ''))) = 'A'
+       WHERE ${conditions.join(' AND ')}
        ORDER BY u.created_at DESC`
     );
 
