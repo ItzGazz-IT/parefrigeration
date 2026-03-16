@@ -656,6 +656,171 @@ app.get('/api/dashboard/units-by-source/:sourceId', async (req, res) => {
   }
 });
 
+app.get('/api/dashboard/quarantine', async (_req, res) => {
+  try {
+    const [modelColumns, unitColumns] = await Promise.all([
+      pool.query(
+        `SELECT COLUMN_NAME
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ?
+           AND TABLE_NAME = 'models'
+           AND COLUMN_NAME IN ('model_code', 'model_name', 'model_number', 'model_no', 'model', 'name')`,
+        [process.env.DB_NAME]
+      ),
+      pool.query(
+        `SELECT COLUMN_NAME
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ?
+           AND TABLE_NAME = 'units'
+           AND COLUMN_NAME IN ('supplier_status', 'stock_status', 'warehouse_id', 'source_id', 'stock_type', 'updated_at')`,
+        [process.env.DB_NAME]
+      ),
+    ]);
+
+    const unitColumnNames = new Set(unitColumns[0].map((column) => column.COLUMN_NAME));
+    if (!unitColumnNames.has('stock_type')) {
+      return res.json({ rows: [] });
+    }
+
+    const preferredOrder = ['model_code', 'model_name', 'model_number', 'model_no', 'model', 'name'];
+    const availableModelColumns = new Set(modelColumns[0].map((column) => column.COLUMN_NAME));
+    const chosenModelColumn = preferredOrder.find((column) => availableModelColumns.has(column));
+    const modelSelect = chosenModelColumn ? `m.\`${chosenModelColumn}\`` : 'CAST(u.model_id AS CHAR)';
+
+    const supplierStatusSelect = unitColumnNames.has('supplier_status') ? 'u.supplier_status' : 'NULL';
+    const stockStatusSelect = unitColumnNames.has('stock_status') ? 'u.stock_status' : 'NULL';
+    const warehouseIdSelect = unitColumnNames.has('warehouse_id') ? 'u.warehouse_id' : 'NULL';
+    const sourceIdSelect = unitColumnNames.has('source_id') ? 'u.source_id' : 'NULL';
+
+    const conditions = ["UPPER(TRIM(COALESCE(u.stock_type, ''))) = 'Q'"];
+    if (unitColumnNames.has('source_id')) {
+      conditions.push('u.source_id = 4');
+    }
+
+    const [rows] = await pool.query(
+      `SELECT
+         u.id,
+         u.model_id,
+         ${modelSelect} AS model,
+         ${supplierStatusSelect} AS supplier_status,
+         ${stockStatusSelect} AS stock_status,
+         ${warehouseIdSelect} AS warehouse_id,
+         ${sourceIdSelect} AS source_id,
+         u.serial_number,
+         u.stock_type,
+         u.status,
+         u.delivered,
+         u.date_received,
+         u.created_at
+       FROM units u
+       LEFT JOIN models m ON m.id = u.model_id
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY u.created_at DESC`
+    );
+
+    return res.json({ rows });
+  } catch (error) {
+    console.error('Quarantine query failed:', error);
+    return res.status(500).json({ error: 'Failed to load quarantine units' });
+  }
+});
+
+app.post('/api/dashboard/quarantine/release', async (req, res) => {
+  const { unitId, stockType, docsReceived } = req.body || {};
+  const parsedUnitId = Number.parseInt(unitId, 10);
+  const nextStockType = String(stockType || '').trim().toUpperCase();
+  const docsConfirmed = docsReceived === true || docsReceived === 1 || docsReceived === '1';
+
+  if (Number.isNaN(parsedUnitId) || parsedUnitId <= 0) {
+    return res.status(400).json({ error: 'Valid unitId is required' });
+  }
+
+  if (!['B', 'Y'].includes(nextStockType)) {
+    return res.status(400).json({ error: 'stockType must be B or Y' });
+  }
+
+  if (!docsConfirmed) {
+    return res.status(400).json({ error: 'docsReceived must be confirmed before release' });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const unitColumns = await getTableColumns(connection, 'units');
+    if (!unitColumns.has('stock_type')) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'units.stock_type column does not exist' });
+    }
+
+    const selectColumns = ['id', 'serial_number', 'stock_type'];
+    if (unitColumns.has('source_id')) {
+      selectColumns.push('source_id');
+    }
+
+    const [unitRows] = await connection.query(
+      `SELECT ${selectColumns.map((columnName) => `\`${columnName}\``).join(', ')} FROM units WHERE id = ? LIMIT 1 FOR UPDATE`,
+      [parsedUnitId]
+    );
+
+    if (!unitRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Unit not found' });
+    }
+
+    const unit = unitRows[0];
+    const currentStockType = String(unit.stock_type || '').trim().toUpperCase();
+    if (currentStockType !== 'Q') {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Only units with stock_type Q can be released from quarantine' });
+    }
+
+    const updateStatements = ['`stock_type` = ?'];
+    const updateValues = [nextStockType];
+
+    if (unitColumns.has('source_id')) {
+      updateStatements.push('`source_id` = 4');
+    }
+
+    const docsFlagColumn = chooseExistingColumn(unitColumns, ['docs_received', 'documents_received', 'documentation_received']);
+    if (docsFlagColumn) {
+      updateStatements.push(`\`${docsFlagColumn}\` = 1`);
+    }
+
+    const docsAtColumn = chooseExistingColumn(unitColumns, ['docs_received_at', 'documents_received_at', 'documentation_received_at']);
+    if (docsAtColumn) {
+      updateStatements.push(`\`${docsAtColumn}\` = NOW()`);
+    }
+
+    if (unitColumns.has('updated_at')) {
+      updateStatements.push('`updated_at` = NOW()');
+    }
+
+    updateValues.push(parsedUnitId);
+
+    await connection.query(
+      `UPDATE units SET ${updateStatements.join(', ')} WHERE id = ?`,
+      updateValues
+    );
+
+    await connection.commit();
+    return res.json({
+      ok: true,
+      unitId: parsedUnitId,
+      serialNumber: unit.serial_number || null,
+      previousStockType: currentStockType,
+      newStockType: nextStockType,
+      movedToSourceId: unitColumns.has('source_id') ? 4 : null,
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Quarantine release failed:', error);
+    return res.status(500).json({ error: 'Failed to release unit from quarantine' });
+  } finally {
+    connection.release();
+  }
+});
+
 app.get('/api/dashboard/rare-cases', async (_req, res) => {
   try {
     const [modelColumns, unitColumns] = await Promise.all([

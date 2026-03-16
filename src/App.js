@@ -42,6 +42,7 @@ const SCAN_OUT_NAMES = {
 const DRAWER_WIDTH = 74;
 const TOP_NAV_ITEMS = [
   { key: 'dashboard', label: 'Dashboard' },
+  { key: 'quarantine', label: 'Quarantine' },
   { key: 'rareCases', label: 'Rare Cases' },
   { key: 'weeklyReport', label: 'Weekly Report' },
 ];
@@ -117,6 +118,10 @@ function App() {
       const warehouseName = warehouse?.name || warehouse?.warehouse_name || warehouse?.warehouse || warehouse?.title || `Warehouse ${warehouseId}`;
       const sourceName = SOURCE_NAMES[sourceId] || `Source ${sourceId}`;
       const title = `${warehouseName} – ${sourceName}`;
+      const sourceSpecificFilter = sourceId === 4
+        ? (row) => String(row.stock_type ?? '').trim().toUpperCase() !== 'Q'
+        : undefined;
+
       return {
         title,
         component: (
@@ -125,6 +130,7 @@ function App() {
             title={title}
             endpoint={`/api/dashboard/units-by-warehouse-source/${warehouseId}/${sourceId}`}
             subtitle={`Units in ${warehouseName} from ${sourceName}`}
+            rowFilter={sourceSpecificFilter}
             hiddenColumns={['stock_status', 'source_id', 'date_received', 'created_at']}
           />
         ),
