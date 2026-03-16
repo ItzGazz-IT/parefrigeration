@@ -12,6 +12,7 @@ import WarehousesPage from './pages/WarehousesPage';
 import QuarantinePage from './pages/QuarantinePage';
 import WeeklyReportPage from './pages/WeeklyReportPage';
 import ArchivePage from './pages/ArchivePage';
+import TakealotPage from './pages/TakealotPage';
 import ExchangesPage from './pages/ExchangesPage';
 import InhouseExchangesPage from './pages/InhouseExchangesPage';
 import BoughtBackPage from './pages/BoughtBackPage';
@@ -46,6 +47,7 @@ const TOP_NAV_ITEMS = [
   { key: 'quarantine', label: 'Quarantine' },
   { key: 'rareCases', label: 'Rare Cases' },
   { key: 'weeklyReport', label: 'Weekly Report' },
+  { key: 'takealot', label: 'Takealot' },
   { key: 'archive', label: 'Archive' },
 ];
 
@@ -104,6 +106,7 @@ function App() {
       scannedInSource6: { title: 'Scanned In - Source 6', component: <BoughtBackPage /> },
       rareCases: { title: 'Rare Cases', component: <RareCasesPage /> },
       weeklyReport: { title: 'Weekly Report', component: <WeeklyReportPage /> },
+      takealot: { title: 'Takealot', component: <TakealotPage /> },
       archive: { title: 'Archive', component: <ArchivePage /> },
       models: { title: 'Models', component: <ModelsPage /> },
       warehouses: { title: 'Warehouses', component: <WarehousesPage /> },

@@ -557,6 +557,71 @@ const syncInhouseExchangeFromSource = async (connection) => {
   return syncedCount;
 };
 
+const syncTakealotFromSource = async (connection) => {
+  const sourceColumns = await getTableColumns(connection, 'takealot_scans');
+  const serialColumn = chooseExistingColumn(sourceColumns, ['serial_number', 'serial']);
+  if (!serialColumn) {
+    return 0;
+  }
+
+  const modelColumn = chooseExistingColumn(sourceColumns, ['model_id']);
+  const warehouseColumn = chooseExistingColumn(sourceColumns, ['warehouse_id']);
+  const poColumn = chooseExistingColumn(sourceColumns, ['po_number', 'po_no']);
+  const createdAtColumn = chooseExistingColumn(sourceColumns, ['timestamp', 'created_at', 'scanned_at', 'date']);
+
+  const [missingRows] = await connection.query(
+    `SELECT
+       s.\`${serialColumn}\` AS serial_number,
+       ${modelColumn ? `s.\`${modelColumn}\`` : 'NULL'} AS model_id,
+       ${warehouseColumn ? `s.\`${warehouseColumn}\`` : 'NULL'} AS warehouse_id,
+       ${poColumn ? `s.\`${poColumn}\`` : 'NULL'} AS po_number,
+       ${createdAtColumn ? `s.\`${createdAtColumn}\`` : 'NOW()'} AS source_created_at
+     FROM takealot_scans s
+     WHERE s.\`${serialColumn}\` IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1
+         FROM scan_out_events e
+         WHERE e.scan_type = 'TAKEALOT'
+           AND e.serial_number = s.\`${serialColumn}\`
+       )
+     ORDER BY ${createdAtColumn ? `s.\`${createdAtColumn}\`` : 's.id'} DESC`
+  );
+
+  let syncedCount = 0;
+  for (const row of missingRows) {
+    const serialNumber = String(row.serial_number || '').trim();
+    if (!serialNumber) {
+      continue;
+    }
+
+    const [unitRows] = await connection.query(
+      'SELECT id, model_id, warehouse_id FROM units WHERE serial_number = ? LIMIT 1',
+      [serialNumber]
+    );
+
+    const unit = unitRows[0] || {};
+    const eventTimestamp = row.source_created_at || new Date();
+
+    await buildInsertFromLogicalFields(connection, 'scan_out_events', {
+      unitId: unit.id || null,
+      modelId: row.model_id || unit.model_id || null,
+      warehouseId: row.warehouse_id || unit.warehouse_id || null,
+      serialNumber,
+      scanType: SCAN_TYPES.TAKEALOT,
+      poNumber: row.po_number || null,
+      paymentStatus: 'PENDING_IO',
+      includeWeeklyReport: 0,
+      status: 'SOLD',
+      scannedAt: eventTimestamp,
+      createdAt: eventTimestamp,
+    });
+
+    syncedCount += 1;
+  }
+
+  return syncedCount;
+};
+
 const validateScanPayload = (payload) => {
   const { scanType, serialNumber } = payload;
 
@@ -1296,6 +1361,9 @@ app.get('/api/dashboard/scan-out-by-warehouse-type/:warehouseId/:scanType', asyn
     if (scanType === SCAN_TYPES.INHOUSE_EXCHANGE) {
       await syncInhouseExchangeFromSource(connection);
     }
+    if (scanType === SCAN_TYPES.TAKEALOT) {
+      await syncTakealotFromSource(connection);
+    }
 
     if (scanType === SCAN_TYPES.TFFW_EXCHANGE) {
       await syncTffwExchangeFromSource(connection);
@@ -1421,6 +1489,48 @@ app.get('/api/dashboard/inhouse-exchanges', async (_req, res) => {
   }
 });
 
+app.get('/api/dashboard/takealot', async (_req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await syncTakealotFromSource(connection);
+
+    const [unitColumns] = await Promise.all([
+      getTableColumns(connection, 'units'),
+    ]);
+    const unitsSupplierStatusColumn = chooseExistingColumn(unitColumns, ['supplier_status']);
+
+    const [rows] = await connection.query(
+      `SELECT
+         e.id,
+         e.serial_number,
+         e.scan_type,
+         ${unitsSupplierStatusColumn ? `u.\`${unitsSupplierStatusColumn}\`` : 'NULL'} AS supplier_status,
+         e.payment_status,
+         e.io_number,
+         e.po_number,
+         e.created_at,
+         e.warehouse_id
+       FROM scan_out_events e
+       ${unitsSupplierStatusColumn ? 'LEFT JOIN units u ON u.`serial_number` = e.serial_number' : ''}
+       WHERE e.scan_type = 'TAKEALOT'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM archive_records ar
+           WHERE ar.source_event_id = e.id
+              OR (ar.serial_number = e.serial_number AND ar.scan_type = e.scan_type)
+         )
+       ORDER BY e.created_at DESC, e.id DESC`
+    );
+
+    return res.json({ rows });
+  } catch (error) {
+    console.error('Takealot query failed:', error);
+    return res.status(500).json({ error: 'Failed to load Takealot rows' });
+  } finally {
+    connection.release();
+  }
+});
+
 app.get('/api/dashboard/units-inhouse-exchanges', async (_req, res) => {
   try {
     const rows = await getUnitsRows(5);
@@ -1473,6 +1583,7 @@ app.get('/api/dashboard/weekly-report', async (_req, res) => {
   try {
     await syncTffwExchangeFromSource(connection);
     await syncInhouseExchangeFromSource(connection);
+    await syncTakealotFromSource(connection);
 
     const [eventSummaryRows] = await connection.query(
       `SELECT
