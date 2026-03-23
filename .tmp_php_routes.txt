@@ -1,0 +1,6 @@
+1
+ACTUAL_SALE
+GET
+POST
+TAKEALOT
+warehouse_id
